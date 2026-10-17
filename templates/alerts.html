@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% from "_macros.html" import alert_dot, alert_kind %}
+{% block title %}Alerts{% endblock %}
+{% block content %}
+<h1 class="headline">Alerts</h1>
+<div class="panel">
+  <ul class="alert-list">
+    {% for a in alerts %}
+    <li>
+      {{ alert_dot(a) }}
+      <div>
+        {{ alert_kind(a) }}
+        <div class="alert-title">{% if a.drive_id %}<a href="{{ url_for('drive', drive_id=a.drive_id) }}">{{ a.title }}</a>{% else %}{{ a.title }}{% endif %}</div>
+        {% if a.detail %}<div class="quiet small">{{ a.detail }}</div>{% endif %}
+        <div class="alert-meta">{% if a.host %}{{ a.host }} · {% endif %}{{ a.ts|time }} · {{ 'sent to ' ~ a.channels if a.channels else 'not sent' }}</div>
+      </div>
+    </li>
+    {% else %}
+    <li class="empty">No alerts yet.</li>
+    {% endfor %}
+  </ul>
+  <div class="pager">
+    {% if page > 1 %}<a href="?page={{ page - 1 }}">← Newer</a>{% else %}<span></span>{% endif %}
+    {% if has_next %}<a href="?page={{ page + 1 }}">Older →</a>{% endif %}
+  </div>
+</div>
+{% endblock %}

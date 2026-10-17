@@ -1,0 +1,54 @@
+name: Bug report
+description: Something does not work as described
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Issues are public: **never post tokens, passwords, `secrets.env`,
+        `agent.env`, real host names, IP addresses or drive serial numbers.** Replace them with placeholders.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, and what went wrong.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Add an agent on a host with an NVMe drive
+        2. Wait for the first report
+        3. Open the drive's page
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Shown at the bottom of the page, or the image tag from the `image:` line of your docker-compose.yml.
+    validations:
+      required: true
+  - type: input
+    id: drive
+    attributes:
+      label: Drive and connection
+      placeholder: e.g. Samsung 990 PRO via NVMe / WD Red via USB enclosure
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Container log
+      description: The relevant lines from `docker logs mimamori` or `docker logs mimamori-agent`. Check them for private data first.
+      render: text
+    validations:
+      required: false

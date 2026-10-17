@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge, alert_item %}
+{% block title %}Overview{% endblock %}
+{% block content %}
+<p class="date">{{ today.strftime('%A') }}, {{ today.day }} {{ today.strftime('%B') }}</p>
+<h1 class="headline">{{ lead }}{% if attention %} <em>{{ attention }}</em>{% endif %}</h1>
+
+<div class="tiles">
+  <div class="tile wide-only"><div class="label">Drives</div><div class="value">{{ drives|length }}</div><div class="sub">on {{ agents|length }} host{{ 's' if agents|length != 1 }}</div></div>
+  <div class="tile"><div class="label">Healthy</div><div class="value ok">{{ counts.healthy }}</div><div class="sub">no open issues</div></div>
+  <div class="tile"><div class="label">Watch</div><div class="value warn">{{ counts.watch }}</div><div class="sub">a warning threshold reached</div></div>
+  <div class="tile"><div class="label">Failing</div><div class="value crit">{{ counts.failing }}</div><div class="sub">a critical threshold reached</div></div>
+  <div class="tile"><div class="label">Missing</div><div class="value">{{ counts.missing }}</div><div class="sub">not responding</div></div>
+  <div class="tile wide-only"><div class="label">Warmest</div>
+    {% if warmest %}<div class="value">{{ warmest.latest.temp }} °C</div><div class="sub">{{ warmest.model }} · {{ warmest.device|replace('/dev/', '') }}</div>
+    {% else %}<div class="value">–</div><div class="sub">no readings yet</div>{% endif %}
+  </div>
+</div>
+
+<div class="grid-main">
+  <div>
+    {% if not agents %}
+    <div class="panel">
+      <h2>Welcome to mimamori</h2>
+      <p class="quiet">No agents yet. An agent runs on each host whose drives you want to watch and reports to this page.</p>
+      <a class="btn primary" href="{{ url_for('settings') }}#agents">Add your first agent</a>
+    </div>
+    {% endif %}
+
+    {# wide screens: cards #}
+    <div class="hosts-cards">
+    {% for a in agents %}
+    <section class="host">
+      <div class="host-head">
+        <h2>{{ a.name }}{% if a.location %} <span>· {{ a.location }}</span>{% endif %}</h2>
+        <span class="presence"><span class="dot {{ 'on' if a.online else 'crit' }}"></span>
+          {% if a.online %}agent online · reported {{ a.last_report|ago }}{% elif a.last_seen %}agent offline · last seen {{ a.last_seen|ago }}{% else %}waiting for the agent to connect{% endif %}
+        </span>
+      </div>
+      {% if a.drives %}
+      <div class="cards">
+        {% for d in a.drives %}
+        {% set s = d.latest %}
+        <a class="card {{ d.status }}" href="{{ url_for('drive', drive_id=d.id) }}">
+          <div class="card-head">{{ badge(d.status) }}<span class="mono quiet">{{ d.device }}</span></div>
+          <h3 class="card-title">{{ d.model or 'Unknown drive' }}</h3>
+          <div class="card-meta">{{ d.kind|kind }}{% if d.capacity %} · {{ d.capacity|bytes }}{% endif %} · <span class="mono">{{ d.serial|serial }}</span></div>
+          <div class="metrics">
+            {% if d.status == 'missing' %}
+            <div><div class="k">Temp</div><div class="v">–</div></div>
+            <div><div class="k">Power on</div><div class="v">–</div></div>
+            <div><div class="k">Last seen</div><div class="v">{{ d.last_seen|time(false) }}</div></div>
+            {% else %}
+            <div><div class="k">Temp</div><div class="v {{ d.issues.temp.level if d.issues.temp }}">{{ '–' if s.temp is none else s.temp ~ ' °C' }}</div></div>
+            <div><div class="k">Power on</div><div class="v">{{ s.power_on_hours|num }} h</div></div>
+            {% if d.kind == 'hdd' or (s.wear is none and s.reallocated is not none) %}
+              {% if s.pending and not s.reallocated %}
+              <div><div class="k">Pending</div><div class="v {{ d.issues.pending.level if d.issues.pending }}">{{ s.pending|num }}</div></div>
+              {% else %}
+              <div><div class="k">Realloc</div><div class="v {{ d.issues.reallocated.level if d.issues.reallocated }}">{{ s.reallocated|num }}</div></div>
+              {% endif %}
+            {% else %}
+            <div><div class="k">Wear</div><div class="v {{ d.issues.wear.level if d.issues.wear }}">{{ '–' if s.wear is none else s.wear ~ ' %' }}</div></div>
+            {% endif %}
+            {% endif %}
+          </div>
+          {% if d.spark %}
+          <svg class="spark {{ d.status }}" viewBox="0 0 180 28" preserveAspectRatio="none" aria-hidden="true"><polyline points="{{ d.spark }}"></polyline></svg>
+          {% else %}<div class="spark"></div>{% endif %}
+          <div class="card-foot">
+            {% if d.status == 'missing' %}Not responding to smartctl since {{ d.last_seen|time(false) }}
+            {% elif d.summary %}Checked {{ s.ts|time(false) }} · {{ d.summary }}
+            {% elif d.standby %}Asleep (standby) · not woken up for the check
+            {% elif s.temp is none and s.power_on_hours is none %}Checked {{ s.ts|time(false) }} · no SMART data from this device
+            {% else %}Checked {{ s.ts|time(false) }} · 14 days of temperature{% endif %}
+          </div>
+        </a>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="empty">No drives reported by this agent yet.</p>
+      {% endif %}
+    </section>
+    {% endfor %}
+    </div>
+
+    {# narrow screens: compact rows #}
+    <div class="rows">
+    {% for a in agents %}
+      <div class="host-caption">{{ a.name }}{% if a.location %} · {{ a.location }}{% endif %}{% if not a.online %} · offline{% endif %}</div>
+      {% for d in a.drives %}
+      {% set s = d.latest %}
+      <a class="drow {{ d.status }}" href="{{ url_for('drive', drive_id=d.id) }}">
+        <span class="dot {{ d.status }}"></span>
+        <div>
+          <div class="t">{{ d.model or 'Unknown drive' }} · {{ d.device|replace('/dev/', '') }}</div>
+          <div class="s">{% if d.status == 'missing' %}Missing since {{ d.last_seen|time(false) }}{% elif d.summary %}{{ d.status|capitalize }} · {{ d.summary }}{% elif s.wear is not none %}Healthy · {{ s.wear }} % worn{% else %}Healthy · {{ s.power_on_hours|num }} h{% endif %}</div>
+        </div>
+        <span class="temp">{{ '–' if d.status == 'missing' or s.temp is none else s.temp ~ '°' }}</span>
+      </a>
+      {% else %}
+      <p class="empty">No drives reported yet.</p>
+      {% endfor %}
+    {% endfor %}
+    </div>
+  </div>
+
+  <aside>
+    <div class="panel">
+      <div class="panel-head"><h2>Recent alerts</h2><a class="small" href="{{ url_for('alerts') }}">All alerts</a></div>
+      <ul class="alert-list">
+        {% for a in alerts %}{{ alert_item(a) }}{% else %}<li class="empty">No alerts yet. Calm waters.</li>{% endfor %}
+      </ul>
+    </div>
+    <div class="panel">
+      <div class="quiet small">Weekly report</div>
+      {% if report_next %}
+      <p class="report-time">{{ report_next.strftime('%A %H:%M') }} · {{ report_next.tzname() }}</p>
+      {% else %}<p class="report-time">Turned off</p>{% endif %}
+      <p class="quiet small">{% if channels %}Goes to {{ channels|join(', ') }}.{% else %}No notification channel configured yet.{% endif %}
+        {% if report_last %}Last sent {{ report_last|time }}.{% endif %}</p>
+      <a class="small" href="{{ url_for('report_page') }}">Preview this week's report</a>
+    </div>
+  </aside>
+</div>
+{% endblock %}

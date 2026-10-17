@@ -1,0 +1,33 @@
+FROM python:3.14-alpine
+
+LABEL org.opencontainers.image.title="mimamori-agent" \
+      org.opencontainers.image.description="Small agent for mimamori: reads the SMART data of a host's drives and reports it to the mimamori server, end-to-end encrypted." \
+      org.opencontainers.image.source="https://github.com/Pascal2108/mimamori" \
+      org.opencontainers.image.licenses="AGPL-3.0-only"
+
+# smartctl reads the drives
+RUN apk add --no-cache smartmontools
+
+# Log lines appear in `docker logs` / Portainer immediately
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+COPY requirements-agent.txt .
+# pip is not needed once the packages are in, and its own bundled libraries only add
+# attack surface and findings in vulnerability scans
+RUN pip install --no-cache-dir -r requirements-agent.txt \
+ && pip uninstall -y pip \
+ && rm -rf "$(python -c 'import ensurepip, os; print(os.path.dirname(ensurepip.__file__))')"
+
+COPY agent.py LICENSE ./
+
+# The version reported to the server, set by the build workflow
+ARG VERSION=dev
+ENV APP_VERSION=$VERSION
+
+# Reading raw drives needs root inside the container. docker-compose.agent.yml drops every
+# capability except the two smartctl needs, and the container is read-only.
+HEALTHCHECK CMD python agent.py health || exit 1
+
+CMD ["python", "agent.py"]

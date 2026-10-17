@@ -1,0 +1,4 @@
+{% if unsafe_notes %}<div class="unsafes" role="{{ 'alert' if unsafe_notes | selectattr('level', 'eq', 'strong') | list else 'note' }}">
+  {% for note in unsafe_notes %}<div class="unsafe {{ note.level }}"><b>Unsafe:</b> {{ note.text }}</div>
+  {% endfor %}</div>
+{% endif %}

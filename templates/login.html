@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Log in{% endblock %}
+{% block content %}
+<div class="login">
+  <div class="brand">
+    <img src="{{ url_for('static', filename='logo.svg') }}" alt="">
+    <div><b>mimamori</b><br><span lang="ja">見守り</span></div>
+  </div>
+  {% if http_hint %}
+  <div class="banner unsafe-hint" role="alert">This page was opened over plain HTTP, so your browser will not keep the login. Open it through the HTTPS address of your reverse proxy.</div>
+  {% endif %}
+  <div class="panel">
+    <form method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="field">
+        <label for="username">User name</label>
+        <input id="username" name="username" autocomplete="username" required autofocus>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+      </div>
+      {% if error %}<p class="crit small">{{ error }}</p>{% endif %}
+      <button class="btn primary" type="submit">Log in</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

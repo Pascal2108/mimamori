@@ -1,0 +1,15 @@
+.git
+.gitignore
+*.env
+.env*
+secrets/
+data/
+__pycache__/
+.venv/
+design/
+docs/
+README.md
+SECURITY.md
+CLAUDE.md
+.github
+.claude

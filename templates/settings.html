@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+<h1 class="headline">Settings</h1>
+
+<section class="section" id="agents">
+  <h2>Agents</h2>
+  <p>An agent runs on each host and reports its drives to this page. It only connects out, so no port has to be opened on the host, and every message is encrypted and signed with the agent's own key.</p>
+  <div class="panel">
+    {% if agents %}
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Agent</th><th>Status</th><th>Drives</th><th></th></tr></thead>
+      <tbody>
+      {% for a in agents %}
+      <tr class="agent-row">
+        <td>
+          <form class="row" method="post" action="{{ url_for('agent_edit', agent_id=a.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="field"><label for="n-{{ a.id }}">Name</label><input id="n-{{ a.id }}" name="name" value="{{ a.name }}" maxlength="48" required></div>
+            <div class="field"><label for="l-{{ a.id }}">Location</label><input id="l-{{ a.id }}" name="location" value="{{ a.location }}" maxlength="48"></div>
+            <div class="field"><button class="btn small" type="submit">Save</button></div>
+          </form>
+        </td>
+        <td class="small">
+          <span class="presence"><span class="dot {{ 'on' if a.online else 'crit' }}"></span>{% if a.online %}online{% elif a.last_seen %}offline · {{ a.last_seen|ago }}{% else %}never connected{% endif %}</span>
+          {% if a.agent_version %}<div class="quiet">{{ a.agent_version }}{% if a.hostname %} · {{ a.hostname }}{% endif %}</div>{% endif %}
+        </td>
+        <td>{{ a.drive_count }}</td>
+        <td>
+          <form class="inline" method="post" action="{{ url_for('agent_token', agent_id=a.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="btn small" type="submit" title="The old key stops working">New key</button>
+          </form>
+          <details class="confirm">
+            <summary class="btn small danger">Remove…</summary>
+            <form class="confirm-box" method="post" action="{{ url_for('agent_delete', agent_id=a.id) }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button class="btn small danger" type="submit">Remove the agent and its drive history</button>
+            </form>
+          </details>
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    {% else %}
+    <p class="empty">No agents yet.</p>
+    {% endif %}
+  </div>
+  <div class="panel">
+    <h2>Add an agent</h2>
+    <form class="row" method="post" action="{{ url_for('agent_create') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="field"><label for="new-name">Name</label><input id="new-name" name="name" placeholder="docker-host-1" maxlength="48" required></div>
+      <div class="field"><label for="new-loc">Location (optional)</label><input id="new-loc" name="location" placeholder="datacenter" maxlength="48"></div>
+      <div class="field"><button class="btn primary" type="submit">Create agent key</button></div>
+    </form>
+  </div>
+</section>
+
+<section class="section" id="checks">
+  <h2>Checks</h2>
+  <div class="panel">
+    <form method="post" action="{{ url_for('settings_general') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="row">
+        <div class="field"><label for="si">Check drives every (minutes)</label><input id="si" name="scan_interval_minutes" type="number" min="5" max="1440" value="{{ s.scan_interval_minutes }}" required></div>
+        <div class="field"><label for="ao">Agent counts as offline after (minutes)</label><input id="ao" name="agent_offline_minutes" type="number" min="3" max="1440" value="{{ s.agent_offline_minutes }}" required></div>
+        <div class="field"><label for="gw">Growth compares with (days ago)</label><input id="gw" name="growth_window_days" type="number" min="1" max="90" value="{{ s.growth_window_days }}" required></div>
+      </div>
+      <p class="quiet small">Drives in standby are not woken up for a check. Times are shown in {{ tz_name }} (set <span class="mono">TZ</span> in docker-compose.yml to change it).</p>
+      <button class="btn primary" type="submit">Save</button>
+    </form>
+  </div>
+</section>
+
+<section class="section" id="thresholds">
+  <h2>Global thresholds</h2>
+  <p>At or above <b>warn</b> a drive is Watch, at or above <b>crit</b> Failing. <b>Growth</b> sets the level when a counter has risen within the growth window. Leave a field empty to turn that limit off. Each drive can override these on its own page.</p>
+  <div class="panel">
+    <form method="post" action="{{ url_for('settings_thresholds') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="table-wrap">
+      <table class="thresholds">
+        <thead><tr><th>Temperature (°C)</th><th>warn</th><th>crit</th><th></th></tr></thead>
+        <tbody>
+        {% for k in kinds %}
+        <tr>
+          <td>{{ {'hdd': 'Hard drives', 'ssd': 'SATA SSDs', 'nvme': 'NVMe SSDs', 'unknown': 'Other drives'}[k] }}</td>
+          <td><input aria-label="{{ k }} warn" name="temp_{{ k }}_warn" type="number" min="0" max="120" value="{{ thresholds.temp[k].warn if thresholds.temp[k].warn is not none }}" placeholder="off"></td>
+          <td><input aria-label="{{ k }} crit" name="temp_{{ k }}_crit" type="number" min="0" max="120" value="{{ thresholds.temp[k].crit if thresholds.temp[k].crit is not none }}" placeholder="off"></td>
+          <td></td>
+        </tr>
+        {% endfor %}
+        </tbody>
+        <thead><tr><th>Counters</th><th>warn</th><th>crit</th><th>growth</th></tr></thead>
+        <tbody>
+        {% for m, label in counters.items() %}
+        <tr>
+          <td>{{ label[0]|upper }}{{ label[1:] }}</td>
+          <td><input aria-label="{{ m }} warn" name="{{ m }}_warn" type="number" min="0" value="{{ thresholds[m].warn if thresholds[m].warn is not none }}" placeholder="off"></td>
+          <td><input aria-label="{{ m }} crit" name="{{ m }}_crit" type="number" min="0" value="{{ thresholds[m].crit if thresholds[m].crit is not none }}" placeholder="off"></td>
+          <td><select aria-label="{{ m }} growth" name="{{ m }}_growth">{% for g in growth_choices %}<option value="{{ g }}" {{ 'selected' if thresholds[m].growth == g }}>{{ g }}</option>{% endfor %}</select></td>
+        </tr>
+        {% endfor %}
+        <tr>
+          <td>SSD wear (% of endurance used)</td>
+          <td><input aria-label="wear warn" name="wear_warn" type="number" min="0" max="100" value="{{ thresholds.wear.warn if thresholds.wear.warn is not none }}" placeholder="off"></td>
+          <td><input aria-label="wear crit" name="wear_crit" type="number" min="0" max="100" value="{{ thresholds.wear.crit if thresholds.wear.crit is not none }}" placeholder="off"></td>
+          <td></td>
+        </tr>
+        </tbody>
+      </table>
+      </div>
+      <p class="quiet small">A failed SMART overall-health check and NVMe critical-warning flags always count as Failing.</p>
+      <div class="row">
+        <button class="btn primary" type="submit">Save thresholds</button>
+        <button class="btn" type="submit" name="reset" value="1">Reset to defaults</button>
+      </div>
+    </form>
+  </div>
+</section>
+
+<section class="section" id="notifications">
+  <h2>Notifications</h2>
+  <p>Channels are set in <span class="mono">secrets.env</span> and <span class="mono">docker-compose.yml</span>, so webhook addresses and passwords never end up in the database or on this page. Recreate the container after changing them.</p>
+  <div class="panel">
+    {% for name, on in channels.items() %}
+    <div class="channel"><span class="dot {{ 'on' if on else 'off' }}"></span>{{ name }} <span class="quiet small">· {{ 'configured' if on else 'not configured' }}</span></div>
+    {% endfor %}
+    <form method="post" action="{{ url_for('notify_test') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn" type="submit">Send test notification</button>
+    </form>
+  </div>
+</section>
+
+<section class="section" id="report">
+  <h2>Weekly report</h2>
+  <div class="panel">
+    <form method="post" action="{{ url_for('settings_report') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="field"><label class="check"><input type="checkbox" name="report_enabled" value="1" {{ 'checked' if s.report_enabled }}> Send a weekly report</label></div>
+      <div class="row">
+        <div class="field"><label for="rd">Day</label><select id="rd" name="report_weekday">{% for d in weekdays %}<option value="{{ loop.index0 }}" {{ 'selected' if loop.index0 == s.report_weekday }}>{{ d }}</option>{% endfor %}</select></div>
+        <div class="field"><label for="rt">Time ({{ tz_name }})</label><input id="rt" name="report_time" type="time" value="{{ s.report_time }}" required></div>
+      </div>
+      <button class="btn primary" type="submit">Save</button>
+    </form>
+  </div>
+</section>
+{% endblock %}

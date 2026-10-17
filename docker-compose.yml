@@ -1,0 +1,54 @@
+# The mimamori server. The hosts whose drives you want to watch each run the agent from
+# docker-compose.agent.yml.
+services:
+  mimamori:
+    image: ghcr.io/pascal2108/mimamori:latest
+    container_name: mimamori
+    restart: unless-stopped
+    env_file:
+      - secrets.env
+    environment:
+      TZ: Europe/Berlin           # CHANGE: your time zone, for the page and the weekly report
+      # PUBLIC_URL: https://mimamori.example.com   # (optional) HTTPS address of mimamori, for links in notifications and for new agents
+      # RETENTION_DAYS: 400       # (optional) days of history and alerts that are kept
+      # SESSION_HOURS: 12         # (optional) hours you stay signed in
+      # LOG_LEVEL: INFO           # (optional) DEBUG for more detail in the log
+      #
+      # Mail (optional; the password goes into secrets.env)
+      # SMTP_HOST: smtp.example.com
+      # SMTP_PORT: 587            # 587 with starttls, 465 with ssl
+      # SMTP_SECURITY: starttls   # starttls or ssl
+      # SMTP_USER: mimamori@example.com
+      # MAIL_FROM: mimamori@example.com
+      # MAIL_TO: you@example.com  # several addresses separated by commas
+      #
+      # UNSAFE options: off unless you remove the #. Read "Unsafe options" in the README first.
+      # UNSAFE_HTTP: "true"       # UNSAFE: login works over plain HTTP, password and drive data travel unencrypted
+      # UNSAFE_HTTP_WEBHOOKS: "true"   # UNSAFE: Discord and webhook addresses may use http://
+      # UNSAFE_SMTP_PLAINTEXT: "true"  # UNSAFE: allows SMTP_SECURITY: none, mail and SMTP password unencrypted
+      # UNSAFE_HIDE_WARNINGS: "true"   # UNSAFE: the page no longer warns about the options above (the log still does)
+      # BEHIND_PROXY: "false"     # set this when you publish the port below and use no reverse proxy
+    # ports:                      # (optional) only without a reverse proxy, see "Unsafe options" in the README
+    #   - "8000:8000"
+    volumes:
+      - data:/data                # history, settings and agents
+    tmpfs:
+      - /tmp:size=16m
+    # Security hardening, leave as it is
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 100
+    networks:
+      - proxy
+
+volumes:
+  data:
+
+networks:
+  proxy:
+    external: true
+    name: nginx_reverse_proxy     # CHANGE: Docker network of your reverse proxy

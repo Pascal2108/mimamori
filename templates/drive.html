@@ -1,0 +1,197 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge, alert_item, chart %}
+{% block title %}{{ d.model or 'Drive' }}{% endblock %}
+{% macro tile(label, value, sub, cls='') -%}
+<div class="tile"><div class="label">{{ label }}</div><div class="value {{ cls }}">{{ value }}</div><div class="sub">{{ sub }}</div></div>
+{%- endmacro %}
+{% macro week(key) -%}
+{%- set dv = delta(key) -%}
+{%- if dv is none %}–{% elif dv > 0 %}+{{ dv }} this week{% elif dv < 0 %}{{ dv }} this week{% else %}no change this week{% endif -%}
+{%- endmacro %}
+{% macro lvl(key) %}{{ d.issues[key].level if key in d.issues else '' }}{% endmacro %}
+{% block content %}
+<a class="back" href="{{ url_for('overview') }}">← All drives</a>
+<div>{{ badge(d.status) }}</div>
+<div class="drive-head">
+  <div>
+    <h1>{{ d.model or 'Unknown drive' }}</h1>
+    <div class="quiet small">
+      {{ d.host }} · <span class="mono">{{ d.device }}</span> · {{ d.kind|kind }}{% if d.capacity %} {{ d.capacity|bytes }}{% endif %}{% if d.rpm %} · {{ d.rpm }} rpm{% endif %}
+      · serial <span class="mono">{{ d.serial|serial }}</span>{% if d.firmware %} · firmware {{ d.firmware }}{% endif %}
+    </div>
+  </div>
+  <div class="actions">
+    <a class="btn" href="#thresholds">Edit thresholds</a>
+    <form class="inline" method="post" action="{{ url_for('drive_mute', drive_id=d.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn" type="submit">{{ 'Unmute alerts' if d.muted else 'Mute alerts' }}</button>
+    </form>
+  </div>
+</div>
+
+{% if d.muted %}<div class="banner">Alerts for this drive are muted: they are recorded, but no notifications are sent.</div>{% endif %}
+
+{% if d.issues %}
+{% set worst = (d.issues.values()|selectattr('level', 'equalto', 'crit')|list or d.issues.values()|list)[0] %}
+<div class="callout {{ d.status }}">
+  <span class="dot {{ d.status }}"></span>
+  <div>
+    <strong>{{ worst.text }}{% if d.issues|length > 1 %}, plus {{ d.issues|length - 1 }} more issue{{ 's' if d.issues|length > 2 }}{% endif %}.</strong>
+    <p>
+      {% if d.status == 'missing' %}The agent no longer sees this drive. If you removed it on purpose, forget it at the bottom of this page.
+      {% elif 'smart' in d.issues %}The drive itself reports that it is failing. Back up now and replace it.
+      {% elif d.status == 'failing' %}{% if latest.smart_passed %}SMART overall health still says PASSED, but the numbers are getting worse. {% endif %}Back up what lives on it and plan a replacement.
+      {% else %}Keep an eye on it. You can adjust the thresholds below.{% endif %}
+    </p>
+    {% if d.issues|length > 1 %}<p>{% for i in d.issues.values() %}{{ i.text }}{{ '; ' if not loop.last }}{% endfor %}</p>{% endif %}
+  </div>
+</div>
+{% endif %}
+
+<div class="tiles">
+  {{ tile('Temperature', '–' if latest.temp is none else latest.temp ~ ' °C', 'limit ' ~ temp_limits.warn ~ ' °C' if temp_limits.warn is not none else 'no limit', lvl('temp')) }}
+  {{ tile('Power-on', latest.power_on_hours|num ~ ' h', '%.1f years'|format(latest.power_on_hours / 8766) if latest.power_on_hours else '') }}
+  {% if d.kind == 'nvme' %}
+  {{ tile('Wear', '–' if latest.wear is none else latest.wear ~ ' %', 'of rated endurance', lvl('wear')) }}
+  {{ tile('Media errors', latest.media_errors|num, week('media_errors'), lvl('media_errors')) }}
+  {{ tile('Critical warning', latest.critical_warning|num, 'flags from the drive', lvl('critical_warning')) }}
+  {{ tile('SMART', 'PASSED' if latest.smart_passed else ('FAILED' if latest.smart_passed == 0 else '–'), 'overall health', 'crit' if latest.smart_passed == 0 else '') }}
+  {% else %}
+  {{ tile('Reallocated', latest.reallocated|num, week('reallocated'), lvl('reallocated')) }}
+  {{ tile('Pending', latest.pending|num, week('pending'), lvl('pending')) }}
+  {% if d.kind == 'ssd' and latest.wear is not none %}
+  {{ tile('Wear', latest.wear ~ ' %', 'of rated endurance', lvl('wear')) }}
+  {% else %}
+  {{ tile('Uncorrectable', latest.uncorrectable|num, 'offline', lvl('uncorrectable')) }}
+  {% endif %}
+  {{ tile('CRC errors', latest.crc_errors|num, 'cable looks fine' if not latest.crc_errors else 'check the cable', lvl('crc_errors')) }}
+  {% endif %}
+</div>
+
+<nav class="pills" aria-label="Time range">
+  {% for key, days in ranges.items() %}
+  <a href="?range={{ key }}" class="{{ 'active' if days == range_days }}">{{ '1 year' if days == 365 else days ~ ' days' }}</a>
+  {% endfor %}
+</nav>
+
+<div class="charts">
+  <div class="panel chart">
+    <div class="panel-head"><h2>Temperature</h2><span class="legend"><span><i></i>°C</span>{% if temp_limits.warn is not none %}<span><i class="dash"></i>warn {{ temp_limits.warn }}</span>{% endif %}</span></div>
+    {{ chart(charts.temp, 'Temperature over time') }}
+  </div>
+  {% if d.kind == 'nvme' %}
+  <div class="panel chart">
+    <div class="panel-head"><h2>Media errors</h2></div>
+    {{ chart(charts.sectors, 'Media errors over time') }}
+  </div>
+  <div class="panel chart">
+    <div class="panel-head"><h2>Wear</h2><span class="quiet small">% of rated endurance used</span></div>
+    {{ chart(charts.wear, 'Wear over time') }}
+  </div>
+  {% else %}
+  <div class="panel chart">
+    <div class="panel-head"><h2>Reallocated &amp; pending sectors</h2><span class="legend"><span><i class="crit"></i>reallocated</span><span><i class="warn"></i>pending</span></span></div>
+    {{ chart(charts.sectors, 'Reallocated and pending sectors over time') }}
+  </div>
+  <div class="panel chart">
+    <div class="panel-head"><h2>UDMA CRC errors</h2><span class="quiet small">{% if has.crc_errors %}{{ week('crc_errors') }}{% else %}not reported{% endif %}</span></div>
+    {{ chart(charts.crc, 'CRC errors over time') }}
+  </div>
+  {% if d.kind == 'ssd' and has.wear %}
+  <div class="panel chart">
+    <div class="panel-head"><h2>Wear</h2><span class="quiet small">% of rated endurance used</span></div>
+    {{ chart(charts.wear, 'Wear over time') }}
+  </div>
+  {% else %}
+  <div class="panel chart">
+    <div class="panel-head"><h2>Offline uncorrectable</h2><span class="quiet small">{% if has.uncorrectable %}{{ week('uncorrectable') }}{% else %}not reported{% endif %}</span></div>
+    {{ chart(charts.uncorrectable, 'Offline uncorrectable sectors over time') }}
+  </div>
+  {% endif %}
+  {% endif %}
+</div>
+
+<div class="grid-detail">
+  <div>
+    <div class="panel">
+      <div class="panel-head"><h2>SMART attributes</h2>{% if latest.ts %}<span class="quiet small">read {{ latest.ts|time }}</span>{% endif %}</div>
+      {% if attrs %}
+      <div class="table-wrap">
+      <table>
+        <thead><tr>
+          {% if d.kind != 'nvme' %}<th>ID</th>{% endif %}<th>Attribute</th>
+          {% if d.kind != 'nvme' %}<th class="mono">Value</th><th class="mono">Worst</th><th class="mono">Thresh</th>{% endif %}
+          <th class="mono">Raw</th><th class="mono">Week</th>
+        </tr></thead>
+        <tbody>
+        {% for a in attrs %}
+        {% set failing_attr = a.thresh and a.value is not none and a.value <= a.thresh %}
+        <tr>
+          {% if d.kind != 'nvme' %}<td class="quiet">{{ a.id }}</td>{% endif %}
+          <td>{{ a.name }}</td>
+          {% if d.kind != 'nvme' %}
+          <td class="mono {{ 'crit' if failing_attr }}">{{ '%03d'|format(a.value) if a.value is not none else '–' }}</td>
+          <td class="mono">{{ '%03d'|format(a.worst) if a.worst is not none else '–' }}</td>
+          <td class="mono">{{ '%03d'|format(a.thresh) if a.thresh is not none else '–' }}</td>
+          {% endif %}
+          <td class="mono">{{ a.raw if a.raw is not none else '–' }}</td>
+          <td class="mono {{ 'warn' if a.delta and a.delta > 0 and a.id in (1, 5, 196, 197, 198, 199) }}">{% if a.delta is none %}–{% elif a.delta > 0 %}+{{ a.delta }}{% else %}{{ a.delta }}{% endif %}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+      {% else %}<p class="empty">No attributes reported yet.</p>{% endif %}
+    </div>
+  </div>
+  <aside>
+    <div class="panel">
+      <h2>Alert log</h2>
+      <ul class="alert-list">
+        {% for a in alerts %}{{ alert_item(a, false) }}{% else %}<li class="empty">Nothing yet.</li>{% endfor %}
+      </ul>
+    </div>
+    <div class="panel" id="thresholds">
+      <h2>Thresholds</h2>
+      <p class="quiet small">{% if overrides %}This drive overrides some global values.{% else %}Global defaults, no override for this drive.{% endif %}
+        At or above <b>warn</b> the drive is Watch, at or above <b>crit</b> Failing. Growth compares with the value {{ growth_days }} day{{ 's' if growth_days != 1 }} ago.</p>
+      <form method="post" action="{{ url_for('drive_thresholds', drive_id=d.id) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {% set t = thresholds.temp.get(d.kind, thresholds.temp.unknown) %}
+        <div class="row">
+          <div class="field"><label for="tw">Temp warn °C</label><input class="num" id="tw" name="temp_{{ d.kind }}_warn" type="number" min="0" max="120" value="{{ t.warn if t.warn is not none }}" placeholder="off"></div>
+          <div class="field"><label for="tc">Temp crit °C</label><input class="num" id="tc" name="temp_{{ d.kind }}_crit" type="number" min="0" max="120" value="{{ t.crit if t.crit is not none }}" placeholder="off"></div>
+        </div>
+        {% set metrics = ['media_errors', 'wear'] if d.kind == 'nvme' else ['reallocated', 'pending', 'uncorrectable', 'crc_errors'] + (['wear'] if d.kind == 'ssd' else []) %}
+        {% for m in metrics %}
+        {% set c = thresholds[m] %}
+        <div class="row">
+          <div class="field"><label for="{{ m }}_w">{{ m|replace('_', ' ')|capitalize }} warn</label><input class="num" id="{{ m }}_w" name="{{ m }}_warn" type="number" min="0" value="{{ c.warn if c.warn is not none }}" placeholder="off"></div>
+          <div class="field"><label for="{{ m }}_c">crit</label><input class="num" id="{{ m }}_c" name="{{ m }}_crit" type="number" min="0" value="{{ c.crit if c.crit is not none }}" placeholder="off"></div>
+          {% if m != 'wear' %}
+          <div class="field"><label for="{{ m }}_g">growth</label>
+            <select id="{{ m }}_g" name="{{ m }}_growth">{% for g in growth_choices %}<option value="{{ g }}" {{ 'selected' if c.growth == g }}>{{ g }}</option>{% endfor %}</select></div>
+          {% endif %}
+        </div>
+        {% endfor %}
+        <p class="quiet small">Leave a field empty to turn that limit off.</p>
+        <div class="row">
+          <button class="btn primary" type="submit">Save</button>
+          {% if overrides %}<button class="btn" type="submit" name="reset" value="1">Use global values</button>{% endif %}
+        </div>
+      </form>
+    </div>
+    <div class="panel">
+      <h2>Forget this drive</h2>
+      <p class="quiet small">Removes the drive and all of its history. If the agent still sees it, it comes back as a new drive.</p>
+      <details class="confirm">
+        <summary class="btn danger">Forget drive…</summary>
+        <form class="confirm-box" method="post" action="{{ url_for('drive_forget', drive_id=d.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="btn danger" type="submit">Yes, delete its history</button>
+        </form>
+      </details>
+    </div>
+  </aside>
+</div>
+{% endblock %}

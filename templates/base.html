@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+{% include "_head.html" %}
+  <title>{% block title %}mimamori{% endblock %} · mimamori</title>
+</head>
+<body>
+{% set nav = [('overview', 'Overview'), ('alerts', 'Alerts'), ('report_page', 'Weekly report'), ('settings', 'Settings')] %}
+{% if logged_in %}
+<header class="top">
+  <div class="top-inner">
+    <a class="brand" href="{{ url_for('overview') }}">
+      <img src="{{ url_for('static', filename='logo.svg') }}" alt="">
+      <b>mimamori</b><span lang="ja">見守り</span>
+    </a>
+    <nav class="nav" aria-label="Main">
+      {% for endpoint, label in nav %}
+      <a href="{{ url_for(endpoint) }}" class="{{ 'active' if request.endpoint == endpoint or (endpoint == 'overview' and request.endpoint == 'drive') }}">{{ label }}</a>
+      {% endfor %}
+    </nav>
+    <div class="top-right">
+      <span class="quiet">{% if last_check %}Checked {{ last_check|time(false) }} · next {{ next_check|time(false) }}{% else %}No checks yet{% endif %}</span>
+      <form class="inline" method="post" action="{{ url_for('check_now') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="back" value="{{ request.path }}">
+        <button class="btn" type="submit">Check now</button>
+      </form>
+      <form class="inline" method="post" action="{{ url_for('notify_test') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="btn primary" type="submit">Send test notification</button>
+      </form>
+      <form class="inline" method="post" action="{{ url_for('logout') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="btn" type="submit">Log out</button>
+      </form>
+    </div>
+    <details class="menu">
+      <summary aria-label="Menu">☰</summary>
+      <div class="menu-panel">
+        {% for endpoint, label in nav %}
+        <a href="{{ url_for(endpoint) }}" class="{{ 'active' if request.endpoint == endpoint }}">{{ label }}</a>
+        {% endfor %}
+        <form method="post" action="{{ url_for('check_now') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="back" value="{{ request.path }}">
+          <button class="btn" type="submit">Check now</button>
+        </form>
+        <form method="post" action="{{ url_for('notify_test') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="btn primary" type="submit">Send test notification</button>
+        </form>
+        <form method="post" action="{{ url_for('logout') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="btn" type="submit">Log out</button>
+        </form>
+      </div>
+    </details>
+  </div>
+</header>
+{% endif %}
+<main>
+  {% include "_unsafe.html" %}
+  {% for category, message in get_flashed_messages(with_categories=true) %}
+  <div class="banner flash {{ category }}" role="status">{{ message }}</div>
+  {% endfor %}
+  {% block content %}{% endblock %}
+</main>
+{% if logged_in %}<footer class="foot">mimamori {{ version }} · <a href="https://github.com/Pascal2108/mimamori">GitHub</a></footer>{% endif %}
+</body>
+</html>

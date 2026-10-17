@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Connect {{ agent.name }}{% endblock %}
+{% block content %}
+<a class="back" href="{{ url_for('settings') }}#agents">← Settings</a>
+<h1 class="headline">Connect the agent “{{ agent.name }}”</h1>
+<div class="banner unsafe-hint" role="alert"><strong>Copy the key now.</strong> It is shown only once: mimamori keeps only its public part. Anyone with it can send reports as this agent, so keep it out of git, issues and screenshots. If it gets lost or leaks, create a new one under Settings → Agents.</div>
+
+<div class="panel">
+  <h2>1. Put this in <span class="mono">agent.env</span> on the host</h2>
+  <p class="quiet small"><span class="mono">SERVER_URL</span> is the address of mimamori as that host reaches it: the HTTPS address of your reverse proxy, or <span class="mono">http://mimamori:8000</span> when the agent joins the server's Docker network. Every message between agent and server is signed and encrypted, so the key itself never travels over the network.</p>
+<pre class="code">SERVER_URL={{ server_url }}
+AGENT_KEY={{ token }}</pre>
+</div>
+
+<div class="panel">
+  <h2>2. Start the agent with <span class="mono">docker-compose.agent.yml</span></h2>
+  <p class="quiet small">List each drive of the host under <span class="mono">devices</span>. The agent needs to read the raw drives, so it runs as root inside its container, but with every capability dropped except <span class="mono">SYS_RAWIO</span> and <span class="mono">SYS_ADMIN</span> (only for NVMe drives). It opens no port. Then run <span class="mono">docker compose -f docker-compose.agent.yml up -d</span>.</p>
+<pre class="code">services:
+  mimamori-agent:
+    image: {{ image }}
+    container_name: mimamori-agent
+    restart: unless-stopped
+    env_file:
+      - agent.env
+    environment:
+      AGENT_NAME: "{{ agent.name }}"
+    devices:
+      - /dev/sda
+      - /dev/nvme0
+    tmpfs:
+      - /tmp:size=1m
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_RAWIO
+      - SYS_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 64m
+    pids_limit: 32</pre>
+</div>
+<p><a class="btn primary" href="{{ url_for('settings') }}#agents">Done</a></p>
+{% endblock %}

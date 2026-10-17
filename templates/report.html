@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge, alert_item %}
+{% block title %}Weekly report{% endblock %}
+{% block content %}
+<p class="date">Weekly report · {{ r.since|time }} to {{ r.generated|time }}</p>
+<h1 class="headline">{{ r.headline }}</h1>
+
+<div class="tiles">
+  <div class="tile"><div class="label">Healthy</div><div class="value ok">{{ r.counts.healthy }}</div></div>
+  <div class="tile"><div class="label">Watch</div><div class="value warn">{{ r.counts.watch }}</div></div>
+  <div class="tile"><div class="label">Failing</div><div class="value crit">{{ r.counts.failing }}</div></div>
+  <div class="tile"><div class="label">Missing</div><div class="value">{{ r.counts.missing }}</div></div>
+  <div class="tile wide-only"><div class="label">Alerts</div><div class="value">{{ r.alerts|length }}</div><div class="sub">this week</div></div>
+  <div class="tile wide-only"><div class="label">Warmest this week</div>
+    {% if r.warmest %}<div class="value">{{ r.warmest.max_temp }} °C</div><div class="sub">{{ r.warmest.model }} · {{ r.warmest.host }}</div>{% else %}<div class="value">–</div>{% endif %}
+  </div>
+</div>
+
+<div class="grid-detail">
+  <div class="panel">
+    <h2>Drives</h2>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Status</th><th>Drive</th><th>Host</th><th>Now</th><th>Max this week</th></tr></thead>
+      <tbody>
+      {% for d in r.drives %}
+      <tr>
+        <td>{{ badge(d.status) }}</td>
+        <td><a href="{{ url_for('drive', drive_id=d.id) }}">{{ d.model or 'Unknown drive' }}</a> <span class="mono quiet">{{ d.device }}</span>{% if d.summary %}<div class="quiet small">{{ d.summary }}</div>{% endif %}</td>
+        <td>{{ d.host }}</td>
+        <td>{{ '–' if d.temp is none else d.temp ~ ' °C' }}</td>
+        <td>{{ '–' if d.max_temp is none else d.max_temp ~ ' °C' }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="empty">No drives yet.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+  <aside>
+    <div class="panel">
+      <h2>Delivery</h2>
+      <p class="quiet small">
+        {% if enabled %}Sent every {{ next_time.strftime('%A at %H:%M') }} ({{ next_time.tzname() }}).{% else %}Scheduled sending is off.{% endif %}
+        {% if channels %}Goes to {{ channels|join(', ') }}.{% else %}No notification channel is configured.{% endif %}
+        {% if last_sent %}Last sent {{ last_sent|time }}.{% endif %}
+      </p>
+      <form method="post" action="{{ url_for('report_send') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="btn" type="submit" {{ 'disabled' if not channels }}>Send this report now</button>
+      </form>
+      <p class="small"><a href="{{ url_for('settings') }}#report">Change the schedule</a></p>
+    </div>
+    <div class="panel">
+      <h2>Alerts this week</h2>
+      <ul class="alert-list">
+        {% for a in r.alerts[:15] %}{{ alert_item(a) }}{% else %}<li class="empty">No alerts this week.</li>{% endfor %}
+      </ul>
+    </div>
+  </aside>
+</div>
+{% endblock %}

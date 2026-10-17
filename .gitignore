@@ -1,0 +1,43 @@
+# --- Secrets (never commit) ---
+secrets.env
+agent.env
+*.env
+.env
+.env.*
+!*.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+docker-compose.override.yml
+
+# --- Local data (history database, test setups) ---
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.claude/settings.local.json
+CLAUDE.md
+CLAUDE.local.md
+Thumbs.db
+desktop.ini
+.DS_Store

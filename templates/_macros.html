@@ -1,0 +1,47 @@
+{% macro badge(status) -%}
+<span class="badge {{ status }}"><span class="dot {{ status }}"></span>{{ status }}</span>
+{%- endmacro %}
+
+{% macro alert_kind(a) -%}
+{%- set cls = {'crit': 'crit', 'warn': 'warn', 'ok': 'ok'}.get(a.level, 'quiet') -%}
+{%- if a.kind in ('missing', 'agent_offline') %}{% set cls = 'quiet' %}{% endif -%}
+<span class="alert-kind {{ cls }}">{{ {'new_issue': 'New issue', 'worsened': 'Worsened', 'resolved': 'Resolved', 'missing': 'Missing', 'back': 'Back', 'agent_offline': 'Agent offline', 'agent_online': 'Agent online'}.get(a.kind, a.kind) }}</span>
+{%- endmacro %}
+
+{% macro alert_dot(a) -%}
+{%- if a.kind in ('missing', 'agent_offline') %}<span class="dot missing"></span>
+{%- else %}<span class="dot {{ a.level }}"></span>{% endif -%}
+{%- endmacro %}
+
+{% macro alert_item(a, show_host=true) -%}
+<li>
+  {{ alert_dot(a) }}
+  <div>
+    {{ alert_kind(a) }}
+    <div class="alert-title">{{ a.title }}</div>
+    <div class="alert-meta">{% if show_host and a.host %}{{ a.host }} · {% endif %}{{ a.ts|time }}{% if a.channels %} · sent to {{ a.channels }}{% endif %}</div>
+  </div>
+</li>
+{%- endmacro %}
+
+{% macro chart(c, aria) -%}
+<svg viewBox="0 0 {{ c.w }} {{ c.h }}" role="img" aria-label="{{ aria }}">
+  {% for g in c.grid %}
+  <line class="grid" x1="{{ c.left }}" x2="{{ c.right }}" y1="{{ g.y }}" y2="{{ g.y }}"></line>
+  <text class="axis" x="{{ c.left - 4 }}" y="{{ g.y + 3 }}" text-anchor="end">{{ g.label }}</text>
+  {% endfor %}
+  {% if c.guide is not none %}
+  <line class="guide" x1="{{ c.left }}" x2="{{ c.right }}" y1="{{ c.guide }}" y2="{{ c.guide }}"></line>
+  {% endif %}
+  {% for l in c.lines %}
+  {% if l.area %}<polygon class="area" points="{{ l.area }}"></polygon>{% endif %}
+  <polyline class="{{ l.cls }}" points="{{ l.points }}"></polyline>
+  {% endfor %}
+  {% for x in c.xlabels %}
+  <text class="axis" x="{{ x.x }}" y="{{ c.label_y }}" text-anchor="{{ x.anchor }}">{{ x.label }}</text>
+  {% endfor %}
+  {% if c.empty %}
+  <text class="axis" x="{{ c.w / 2 }}" y="{{ c.h / 2 }}" text-anchor="middle">no data in this range</text>
+  {% endif %}
+</svg>
+{%- endmacro %}
