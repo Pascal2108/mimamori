@@ -124,8 +124,8 @@ def load_config() -> Config:
                      "in secrets.env, then start the container again.")
         raise SystemExit(1)
     if len(password) < MIN_PASSWORD_LENGTH:
-        log.critical("ADMIN_PASSWORD must be at least %d characters long.", MIN_PASSWORD_LENGTH)
-        raise SystemExit(1)
+        log.warning("ADMIN_PASSWORD is shorter than %d characters. Choose a longer one; the page "
+                    "says so too until you do.", MIN_PASSWORD_LENGTH)
 
     security = env("SMTP_SECURITY", "starttls").lower()
     if security not in {"starttls", "ssl", "none"}:
@@ -1398,6 +1398,7 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
     # Changes with the user name or password, which signs out every older session
     session_epoch = hmac.new(secret_key, b"epoch\0" + cfg.admin_user.encode() + b"\0"
                              + cfg.admin_password.encode(), hashlib.sha256).hexdigest()[:16]
+    short_password = len(cfg.admin_password) < MIN_PASSWORD_LENGTH  # allowed, but not advised
     cfg.admin_password = ""  # only the hash stays in memory
     login_limiter = RateLimiter(MAX_TRIES, WINDOW)
     agent_limiter = RateLimiter(30, 300)
@@ -1462,6 +1463,10 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         if cfg.unsafe_hide_warnings:  # chosen by the admin: the log is the only warning left
             return []
         notes = []
+        if short_password and session.get("user"):
+            notes.append({"level": "soft", "text": f"The login password is shorter than "
+                          f"{MIN_PASSWORD_LENGTH} characters. Set a longer ADMIN_PASSWORD in "
+                          "secrets.env and recreate the container."})
         if cfg.unsafe_http and not request.is_secure:
             notes.append({"level": "strong", "text": "This connection is not encrypted. Your "
                           "password and all drive data travel in plain text and can be read by "

@@ -55,7 +55,7 @@ cp secrets.env.example secrets.env
 | Variable | Meaning |
 |---|---|
 | `ADMIN_USER` | User name for the page |
-| `ADMIN_PASSWORD` | Password for the page; at least 12 characters, choose a long one |
+| `ADMIN_PASSWORD` | Password for the page; choose a long one. Shorter than 12 characters works, but the log and the page advise against it |
 | `DISCORD_WEBHOOK_URL` | Optional: a Discord channel webhook (Server Settings → Integrations → Webhooks) |
 | `SMTP_PASSWORD` | Optional: password of the mail account; the other mail settings are in `docker-compose.yml` |
 | `WEBHOOK_URL`, `WEBHOOK_SECRET` | Optional: your own webhook, see [Custom webhook](#custom-webhook) |
@@ -268,7 +268,7 @@ Read the logs with `docker compose logs` on the server and `docker compose -f do
 
 | Message | Cause |
 |---|---|
-| Container keeps restarting, log says `ADMIN_PASSWORD …` | `secrets.env` is missing the password, it is shorter than 12 characters, or it is still the example |
+| Container keeps restarting, log says `ADMIN_PASSWORD …` | `secrets.env` is missing the password, or it is still the example |
 | Login works, but the page asks to sign in again | The page was opened over plain HTTP; open it through the HTTPS address of the proxy |
 | `Too many failed attempts` | Five wrong logins from one address; wait 15 minutes |
 | `502 Bad Gateway` from the proxy | The container is not running, or the forward hostname or network is wrong |
