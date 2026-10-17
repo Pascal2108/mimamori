@@ -42,8 +42,6 @@ There are two parts, each with its own compose file:
 | Server | one host, behind your reverse proxy | `docker-compose.yml`, `secrets.env` | `ghcr.io/pascal2108/mimamori` |
 | Agent | every host with drives to watch, including the server's host if it has some | `docker-compose.agent.yml`, `agent.env` | `ghcr.io/pascal2108/mimamori-agent` |
 
-Both images are also on Docker Hub as [`pascal2108/mimamori`](https://hub.docker.com/r/pascal2108/mimamori) and [`pascal2108/mimamori-agent`](https://hub.docker.com/r/pascal2108/mimamori-agent); either works in the `image:` line.
-
 ### 1. Get the files
 
 ```bash
