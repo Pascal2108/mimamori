@@ -29,7 +29,7 @@ import threading
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import hashes
@@ -264,17 +264,16 @@ class AgentClient:
 
 # ============================================================================
 # Reading the drives
+#
+# The agent only collects: it sends smartctl's own output and the server interprets it. So a
+# newer server can read more from the same data, and an agent pinned to an older version keeps
+# working with every newer server.
 # ============================================================================
 
 DEVICE_PATH = re.compile(r"^/dev/[A-Za-z0-9_\-/.]{1,64}$")
 DEVTYPE = re.compile(r"^[A-Za-z0-9_,+\-]{1,32}$")
 SMARTCTL_TIMEOUT = 90
-# Only what the server needs: error and self-test logs stay on the host
-KEEP_KEYS = {
-    "device", "model_name", "serial_number", "firmware_version", "user_capacity",
-    "rotation_rate", "smart_status", "temperature", "power_on_time", "ata_smart_attributes",
-    "nvme_smart_health_information_log", "scsi_grown_defect_list", "scsi_vendor", "scsi_product",
-}
+MAX_SCAN_BYTES = 8 * 1024 * 1024
 
 
 def _smartctl(args: list[str]) -> dict | None:
@@ -315,17 +314,118 @@ def find_devices() -> list[tuple[str, str]]:
 def scan_devices() -> list[dict]:
     results = []
     for dev, dtype in find_devices():
-        # -n standby: a sleeping drive is not woken up for the check
+        # Read-only queries; -n standby: a sleeping drive is not woken up for the check
         data = _smartctl(["-a", "-n", "standby", *(["-d", dtype] if dtype else []), dev])
         if data is None:
             continue
-        trimmed = {k: v for k, v in data.items() if k in KEEP_KEYS}
+        # Everything about the drive; nothing about the host (kernel version, local time)
+        report = {k: v for k, v in data.items() if k not in {"smartctl", "local_time"}}
         messages = data.get("smartctl", {}).get("messages") if isinstance(
             data.get("smartctl"), dict) else None
         if isinstance(messages, list):
-            trimmed["smartctl"] = {"messages": messages[:10]}
-        results.append({"device": dev, "smartctl": trimmed})
+            report["smartctl"] = {"messages": messages[:10]}
+        results.append({"device": dev, "smartctl": report})
     return results
+
+
+# ============================================================================
+# Privilege separation
+#
+# Reading raw drives needs root and the capabilities SYS_RAWIO / SYS_ADMIN. Talking to the
+# network does not. So the agent splits itself in two at start, like OpenSSH:
+#   - the collector keeps root, but does nothing except run smartctl on the configured drives
+#     when asked, and hand back the result. It never touches the network and accepts exactly
+#     one request, "scan", with no parameters.
+#   - the reporter drops to the user "nobody" with no capabilities at all, then does everything
+#     else: the connection, the encryption, reading the server's answers.
+# A flaw in the network-facing code therefore gives an attacker an unprivileged process
+# without any access to the drives. Where the agent does not run as root (e.g. directly on
+# Windows), there is nothing to drop and it runs as one process.
+# ============================================================================
+
+NOBODY = 65534
+
+
+def _send(sock: socket.socket, data: bytes) -> None:
+    sock.sendall(len(data).to_bytes(4, "big") + data)
+
+
+def _recv(sock: socket.socket, limit: int) -> bytes:
+    def exact(n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("the other half of the agent stopped")
+            buf += chunk
+        return buf
+
+    size = int.from_bytes(exact(4), "big")
+    if size > limit:
+        raise ConnectionError("message too large")
+    return exact(size)
+
+
+def _collector(sock: socket.socket, child: int) -> int:
+    """The privileged half: answers "scan" requests until the reporter stops."""
+    signal.signal(signal.SIGTERM, lambda *_: os.kill(child, signal.SIGTERM))
+    signal.signal(signal.SIGINT, lambda *_: os.kill(child, signal.SIGTERM))
+    try:
+        while True:
+            if _recv(sock, 16) != b"scan":
+                log.error("The reporter sent an unknown request; stopping")
+                break
+            body = json.dumps(scan_devices(), separators=(",", ":")).encode()
+            _send(sock, body if len(body) <= MAX_SCAN_BYTES else b"[]")
+    except (ConnectionError, OSError):
+        pass
+    _, status = os.waitpid(child, 0)
+    return os.waitstatus_to_exitcode(status)
+
+
+def _can_change_user() -> bool:
+    """Whether this process holds CAP_SETUID (bit 7) and CAP_SETGID (bit 6)."""
+    try:
+        with open("/proc/self/status") as f:
+            eff = int(re.search(r"^CapEff:\s*([0-9a-f]+)$", f.read(), re.M).group(1), 16)
+    except (OSError, AttributeError, ValueError):
+        return False
+    return bool(eff & (1 << 7)) and bool(eff & (1 << 6))
+
+
+def _drop_privileges() -> None:
+    try:
+        os.setgroups([])
+        os.setgid(NOBODY)
+        os.setuid(NOBODY)
+    except PermissionError:
+        raise SystemExit("The agent cannot drop its privileges: add SETUID and SETGID under "
+                         "cap_add in docker-compose.agent.yml (see the README)") from None
+    # Changing from root to another user clears every capability; make sure of it
+    with open("/proc/self/status") as f:
+        status = f.read()
+    if os.getuid() == 0 or not re.search(r"^CapEff:\s*0+$", status, re.M) \
+            or not re.search(r"^CapPrm:\s*0+$", status, re.M):
+        raise SystemExit("could not drop privileges; refusing to go on")
+
+
+def _split() -> Callable[[], list[dict]]:
+    """Forks off the privileged collector and returns the reporter's way to ask it for a scan.
+    Only returns in the reporter, which then runs without any privileges."""
+    parent_sock, child_sock = socket.socketpair()
+    pid = os.fork()
+    if pid:  # collector
+        child_sock.close()
+        sys.exit(_collector(parent_sock, pid))
+    parent_sock.close()
+    _drop_privileges()
+
+    def remote_scan() -> list[dict]:
+        _send(child_sock, b"scan")
+        data = json.loads(_recv(child_sock, MAX_SCAN_BYTES))
+        return data if isinstance(data, list) else []
+
+    return remote_scan
 
 
 # ============================================================================
@@ -358,9 +458,21 @@ def run() -> int:
         client = AgentClient(url, agent_key)
     except ValueError as exc:
         return _idle(f"{exc}.")
+    del agent_key
     name = os.environ.get("AGENT_NAME", "").strip() or socket.gethostname()
-    log.info("mimamori agent %s started, reporting to %s (end-to-end encrypted%s)",
-             VERSION, client.host, ", over HTTPS" if client.https else "")
+
+    scan = scan_devices
+    separated = hasattr(os, "fork") and os.geteuid() == 0
+    if separated:
+        if not _can_change_user():
+            return _idle("The agent cannot drop its privileges: add SETUID and SETGID under "
+                         "cap_add in docker-compose.agent.yml (see the README).")
+        scan = _split()  # from here on: user nobody, no capabilities
+        signal.signal(signal.SIGTERM, lambda *_: _stop.set())
+        signal.signal(signal.SIGINT, lambda *_: _stop.set())
+    log.info("mimamori agent %s started, reporting to %s (end-to-end encrypted%s%s)",
+             VERSION, client.host, ", over HTTPS" if client.https else "",
+             "; network part runs without privileges" if separated else "")
 
     next_scan, interval, beat = 0.0, 3600, 60
     while not _stop.is_set():
@@ -370,12 +482,15 @@ def run() -> int:
             interval = max(300, int(info.get("scan_interval", interval)))
             beat = max(15, min(600, int(info.get("heartbeat_interval", beat))))
             if info.get("scan_now") or time.time() >= next_scan:
-                devices = scan_devices()
+                devices = scan()
                 result = client.post("report", {"version": VERSION, "hostname": name,
                                                 "devices": devices})
                 log.info("Reported %d device(s), the server tracks %s drive(s)", len(devices),
                          result.get("drives"))
                 next_scan = time.time() + interval
+        except ConnectionError as exc:
+            log.error("Agent stopped: %s", exc)
+            return 1
         except PermissionError as exc:
             log.error("%s. Copy the current key from Settings → Agents into agent.env, or "
                       "create a new one there.", exc)

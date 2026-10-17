@@ -56,9 +56,10 @@ Not in scope:
 - options named `UNSAFE_*`, which remove protection on purpose and are off by default
 - guessing a weak password; mimamori already limits the attempts per address
 
-The agent runs as root inside its container because reading raw drives needs it; it keeps
-only the capabilities `SYS_RAWIO` and `SYS_ADMIN`. A way to escape that container, or to make
-an agent run anything but smartctl, is in scope.
+The agent starts as root inside its container because reading raw drives needs it. It splits
+itself at start: only the part that runs smartctl keeps root, the network-facing part runs as
+`nobody` without capabilities. A way to escape that container, to gain the collector's rights
+from the network side, or to make an agent run anything but smartctl, is in scope.
 
 mimamori is built for private networks: it has one shared login, no two-factor
 authentication, and it has not been audited.

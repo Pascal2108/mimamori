@@ -31,6 +31,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0          # the version tags, to find the newest stable release
 
       - name: Check Docker Hub settings
         env:
@@ -40,14 +41,35 @@ jobs:
           [ -n "$USERNAME" ] || { echo "::error::Repository variable DOCKERHUB_USERNAME is not set"; exit 1; }
           [ -n "$TOKEN" ] || { echo "::error::Repository secret DOCKERHUB_TOKEN is not set"; exit 1; }
 
-      # main is published as :latest, the beta branch as :beta, the tag v1.0.0 as :1.0.0
+      # Image tags:
+      #   main (and the weekly rebuild of it)  :latest and the major version, e.g. :1
+      #   the beta branch                      :beta
+      #   the tag v1.2.3                       :1.2.3 and :1
+      #   the tag v1.2.4-beta.1                :1.2.4-beta.1 only
+      # The major tag lets an agent be pinned to one major version and still receive the weekly
+      # security rebuilds; within a major version there are no breaking changes.
       - id: image
+        env:
+          IMAGE: ${{ matrix.image }}
+          HUB_USER: ${{ vars.DOCKERHUB_USERNAME }}
         run: |
+          # Newest stable release, e.g. v1.2.3 (tags with a suffix such as -beta.1 do not count)
+          stable=$(git tag --list 'v*.*.*' --sort=-v:refname | grep -v -- '-' | head -n 1 || true)
+          major() { v="${1#v}"; echo "${v%%.*}"; }
           case "$GITHUB_REF" in
-            refs/tags/v*)    echo "tag=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT" ;;
-            refs/heads/main) echo "tag=latest" >> "$GITHUB_OUTPUT" ;;
-            *)               echo "tag=beta" >> "$GITHUB_OUTPUT" ;;
+            refs/tags/v*-*)  tags="${GITHUB_REF_NAME#v}" ;;
+            refs/tags/v*)    tags="${GITHUB_REF_NAME#v} $(major "$GITHUB_REF_NAME")" ;;
+            refs/heads/main) tags="latest${stable:+ $(major "$stable")}" ;;
+            *)               tags="beta" ;;
           esac
+          {
+            echo "tags<<EOF"
+            for t in $tags; do
+              echo "ghcr.io/pascal2108/$IMAGE:$t"
+              echo "docker.io/$HUB_USER/$IMAGE:$t"
+            done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
           # The version shown on the page: the tag, or the branch and commit
           case "$GITHUB_REF" in
             refs/tags/v*) echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT" ;;
@@ -79,9 +101,7 @@ jobs:
           push: true
           build-args: |
             VERSION=${{ steps.image.outputs.version }}
-          tags: |
-            ghcr.io/pascal2108/${{ matrix.image }}:${{ steps.image.outputs.tag }}
-            docker.io/${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.image }}:${{ steps.image.outputs.tag }}
+          tags: ${{ steps.image.outputs.tags }}
 
   # A version tag also gets a release page on GitHub, once its image exists.
   # A tag with a suffix such as v1.0.2-beta.1 is marked as a pre-release, never as the latest.

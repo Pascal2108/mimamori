@@ -14,7 +14,7 @@ AGENT_KEY={{ token }}</pre>
 
 <div class="panel">
   <h2>2. Start the agent with <span class="mono">docker-compose.agent.yml</span></h2>
-  <p class="quiet small">List each drive of the host under <span class="mono">devices</span>. The agent needs to read the raw drives, so it runs as root inside its container, but with every capability dropped except <span class="mono">SYS_RAWIO</span> and <span class="mono">SYS_ADMIN</span> (only for NVMe drives). It opens no port. Then run <span class="mono">docker compose -f docker-compose.agent.yml up -d</span>.</p>
+  <p class="quiet small">List each drive of the host under <span class="mono">devices</span>. The agent needs to read the raw drives, so it starts as root inside its container, then splits: only the part that runs smartctl keeps root, the part that talks to the network runs as <span class="mono">nobody</span> without any capability. It opens no port. Remove <span class="mono">SYS_ADMIN</span> if the host has no NVMe drive, and make <span class="mono">agent.env</span> readable only by root. Then run <span class="mono">docker compose -f docker-compose.agent.yml up -d</span>.</p>
 <pre class="code">services:
   mimamori-agent:
     image: {{ image }}
@@ -33,6 +33,8 @@ AGENT_KEY={{ token }}</pre>
     cap_drop:
       - ALL
     cap_add:
+      - SETUID                # to drop to an unprivileged user at start
+      - SETGID
       - SYS_RAWIO
       - SYS_ADMIN
     security_opt:

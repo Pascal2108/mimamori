@@ -21,7 +21,7 @@ It runs as a server container behind your reverse proxy, plus a small agent cont
 - **Weekly report** with the state of every drive, by mail and Discord, on the day and time you choose
 - **Small agents**: their own image of about 27 MB using about 20 MB of memory. They only connect out, so no port opens on the monitored hosts. Sleeping drives are not woken up for a check
 - **Safe agent connection**: every message between agent and server is encrypted, signed in both directions and cannot be replayed; the server keeps only public keys; see [How agents connect](#how-agents-connect)
-- **Hardened containers**: the server runs as non-root, read-only, with all capabilities dropped; the agent keeps only the two capabilities smartctl needs
+- **Hardened containers**: the server runs as non-root, read-only, with all capabilities dropped. The agent splits itself in two: only a small part that runs smartctl keeps root, the part that talks to the network runs as `nobody` without any capability; see [Security of the agent](#security-of-the-agent)
 
 The page is plain HTML and CSS served from the container, with no JavaScript. It loads nothing from other servers. The screenshots show made-up drives.
 
@@ -115,7 +115,7 @@ Repeat this for every host with drives to watch.
    AGENT_KEY=…
    ```
 
-4. In `docker-compose.agent.yml`, set `AGENT_NAME` and list every drive of the host under `devices` (`ls /dev/sd? /dev/nvme?` shows them). Both are marked `# CHANGE`. If the host has no NVMe drive, remove the line `- SYS_ADMIN`.
+4. In `docker-compose.agent.yml`, set `AGENT_NAME` and list every drive of the host under `devices` (`ls /dev/sd? /dev/nvme?` shows them). Both are marked `# CHANGE`. If the host has no NVMe drive, remove the line `- SYS_ADMIN`. Make `agent.env` readable only by root: `chmod 600 agent.env`.
 5. Start the agent:
 
    ```bash
@@ -140,6 +140,33 @@ An agent never opens a port; it connects to the server once a minute and sends i
 This holds over plain HTTP too, which is why an agent may use `http://` inside a Docker network. Over HTTPS through the proxy, TLS adds a second layer on top.
 
 The server's own key pair is created on its first start and kept in its data volume. If that volume is lost, every agent needs a new key.
+
+### Security of the agent
+
+Reading SMART data needs raw access to the drives, which on Linux means root and the capability `SYS_RAWIO` (and `SYS_ADMIN` for NVMe drives). The agent keeps that power as small and as far from the network as it can:
+
+- **Privilege separation**, like OpenSSH: at start the agent splits into two processes. The **collector** keeps root, but only ever runs `smartctl` on the configured drives when asked; it has no network code and accepts a single request, "scan", without parameters. The **reporter** becomes the user `nobody` with **no capabilities at all**, and does everything else: the connection, the cryptography, reading the server's answers. A flaw in that network-facing code gives an attacker an unprivileged process with no access to the drives.
+- **No open port**: the agent only connects out, to the one server whose key is in its `AGENT_KEY`. Nothing on the network can talk to it first.
+- **The server cannot command it**: the only things an answer can ask for are "check now" and the check interval. There is no way to run commands, change files or choose other devices from the server, even for someone who controls the server.
+- **Read-only**: smartctl only reads from the drives (`-a`), and sleeping drives are not woken up. The container's file system is read-only, and only the drives listed under `devices` exist in it.
+- **Contained**: every capability is dropped except `SETUID`/`SETGID` (needed once for the split), `SYS_RAWIO` and `SYS_ADMIN`; `no-new-privileges`, memory and process limits, Docker's default seccomp profile.
+
+What remains:
+
+- The collector is root with access to the listed drives. A flaw in smartctl itself, triggered by a manipulated drive, would run with those rights. That needs physical access to the host or a malicious drive.
+- `SYS_ADMIN` is a broad capability. Leave it out if the host has no NVMe drive.
+- The agent's private key is in `agent.env` on the host. Whoever can read that file can send reports in the agent's name (not more: see above). Keep the file readable only by root (`chmod 600 agent.env`), and create a new key under Settings → Agents if it may have leaked.
+
+### Security of the server
+
+The server is separate from the agents in every respect: it holds no key that lets anyone act as an agent, and an agent can only ever affect its own drives.
+
+- **Hardened container**: non-root, read-only, every capability dropped, `no-new-privileges`, memory and process limits.
+- **The page**: one login with a lockout after five failed attempts per address, a session cookie that only travels over HTTPS (`__Host-`, `HttpOnly`, `SameSite=Strict`), a CSRF token on every form, a strict Content Security Policy without any JavaScript, and every value escaped. Without HTTPS the login does not work, unless you allow it with `UNSAFE_HTTP`.
+- **Agent messages are hostile input**: every message must carry a valid signature before it is even decrypted; every value from smartctl is type-checked, bounded and truncated. An agent can only change its own drives' data, may send at most one report every 20 seconds, and can trigger at most 20 notifications per hour; more alerts are recorded but not sent, so a compromised host cannot flood your Discord or mailbox.
+- **Secrets** stay in `secrets.env` and in memory; the admin password is kept only as a hash. Logs never contain passwords, keys or webhook addresses.
+
+What remains: mimamori has one shared login without two-factor authentication and has not been audited, which is why it belongs into a private network, not on the internet.
 
 ## Using it
 
@@ -278,11 +305,24 @@ Both images are published under these tags. Set the one you want in the `image:`
 | Tag | Contains | Changes |
 |---|---|---|
 | `latest` | The current stable version | With every release, and weekly for security updates |
+| `0`, `1`, … | The newest stable version within that major version | With every release of that major version, and weekly for security updates |
 | `0.1.0`, `0.2.0`, … | Exactly that [release](https://github.com/Pascal2108/mimamori/releases) | Never; it also receives no security updates |
 | `beta` | What is being tested for the next release | Often; it may break |
 | `0.1.1-beta.1`, … | Exactly that test version ([pre-release](https://github.com/Pascal2108/mimamori/releases)) | Never |
 
 Use `latest` unless you have a reason not to. A version number is for going back when an update causes trouble: the release notes say what changed and whether you have to adjust your `docker-compose.yml`.
+
+### Server and agents are updated separately
+
+The server is backwards compatible with older agents: **every newer server works with every agent that was released before it.** So you can keep the server on `latest` to get every improvement of the page, and update the agents on your hosts only when you choose to.
+
+This works because the agent only collects: it sends smartctl's full output, and the server does all the interpreting. A newer server can read more from the same data, so even an old agent benefits from it. New features never require a newer agent; at most they appear only when the agent is updated too, and the release notes say so.
+
+**Recommended:** keep the server on `latest`, and update the agents by hand when you choose to. Docker only fetches a new agent image when you run `docker compose -f docker-compose.agent.yml pull`, so an agent never changes on its own (unless a tool such as Watchtower does it for you). Before updating an agent, read the release notes: a new agent version may need a change in `docker-compose.agent.yml`, for example a new capability. The server never needs that: it keeps working with the agents you have not updated yet.
+
+`docker-compose.agent.yml` uses `ghcr.io/pascal2108/mimamori-agent:0`, the newest version of major version 0, which also receives the weekly security updates. To freeze an agent at one version, use it exactly, e.g. `mimamori-agent:0.1.0`.
+
+The other way round is not promised: an agent newer than its server may use features the server does not know yet. Update the server first.
 
 ## Questions and feature requests
 

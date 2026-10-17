@@ -51,6 +51,8 @@ VERSION = os.environ.get("APP_VERSION", "dev")
 BASE_DIR = Path(__file__).resolve().parent
 DAY = 86400
 HEARTBEAT_SECONDS = 60
+MIN_REPORT_SECONDS = 20       # per agent
+NOTIFY_LIMIT_PER_HOUR = 20    # notifications per agent; more are recorded but not sent
 EXAMPLE_PASSWORD = "a-long-secure-password"  # the value in secrets.env.example
 MIN_PASSWORD_LENGTH = 12
 
@@ -556,6 +558,11 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 
+# (table, column, definition), applied in order to databases that lack the column.
+# New columns go here instead of into SCHEMA, so databases of older versions get them too.
+MIGRATIONS: list[tuple[str, str, str]] = []
+
+
 class Database:
     def __init__(self, path: Path):
         self.path = path
@@ -563,6 +570,15 @@ class Database:
         self._local = threading.local()
         with self.lock:
             self.conn().executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Columns added after the first release, so a database from an older version keeps
+        working. Only ever add to this list."""
+        for table, column, ddl in MIGRATIONS:
+            names = {r["name"] for r in self.conn().execute(f"PRAGMA table_info({table})")}
+            if column not in names:
+                self.conn().execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -968,6 +984,17 @@ class Monitor:
              detail)).lastrowid
         if drive and drive.get("muted"):
             return
+        # An agent on a compromised host must not be able to flood your channels: past the
+        # limit, alerts are still recorded and shown, but not sent
+        recent = self.db.one("SELECT COUNT(*) AS n FROM alerts WHERE agent_id = ? AND ts > ? "
+                             "AND channels != 'not sent: limit'",
+                             (agent_id, int(time.time()) - 3600))["n"]
+        if recent > NOTIFY_LIMIT_PER_HOUR:
+            self.db.execute("UPDATE alerts SET channels = 'not sent: limit' WHERE id = ?",
+                            (alert_id,))
+            log.warning("More than %d alerts within an hour from one agent; not sending more",
+                        NOTIFY_LIMIT_PER_HOUR)
+            return
         agent = self.db.one("SELECT name FROM agents WHERE id = ?", (agent_id,))
         host = agent["name"] if agent else "unknown host"
         fields: dict[str, Any] = {"Host": host}
@@ -1277,7 +1304,7 @@ RANGES = {"7": 7, "30": 30, "90": 90, "365": 365}
 NUMBER_WORDS = ["No", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine"]
 WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 SCRYPT = {"n": 2**14, "r": 8, "p": 1, "dklen": 32}
-AGENT_IMAGE = "ghcr.io/pascal2108/mimamori-agent:latest"
+AGENT_IMAGE = "ghcr.io/pascal2108/mimamori-agent:0"  # pinned to the major version
 # Simple brute-force protection: max. 5 failed logins per address in 15 minutes.
 # There is no limit across all addresses: anyone could use it to keep the owner locked out.
 MAX_TRIES, WINDOW = 5, 15 * 60
@@ -1609,6 +1636,9 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
     @app.post("/api/agent/v1/report")
     def agent_report():
         agent, data, reply = agent_message("report")
+        # Reports come hourly, or on "Check now"; more often only fills the database
+        if agent["last_report"] and time.time() - agent["last_report"] < MIN_REPORT_SECONDS:
+            abort(429)
         try:
             count = monitor.ingest(agent, data)
         except ValueError:

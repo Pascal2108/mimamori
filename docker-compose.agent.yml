@@ -3,7 +3,10 @@
 # Start with: docker compose -f docker-compose.agent.yml up -d
 services:
   mimamori-agent:
-    image: ghcr.io/pascal2108/mimamori-agent:latest
+    # Major version 0. It only changes when you run "docker compose pull": update agents by
+    # hand and read the release notes first. The server can stay on :latest; it works with
+    # every older agent.
+    image: ghcr.io/pascal2108/mimamori-agent:0
     container_name: mimamori-agent
     restart: unless-stopped
     env_file:
@@ -16,13 +19,17 @@ services:
       - /dev/sda
     tmpfs:
       - /tmp:size=1m
-    # Security hardening, leave as it is. Reading raw drives needs root inside the container;
-    # every capability is dropped except SYS_RAWIO (SATA/SAS drives) and SYS_ADMIN (only
-    # needed for NVMe drives: remove that line if the host has none).
+    # Security hardening, leave as it is. Reading raw drives needs root inside the container,
+    # so the agent splits itself at start: a small root part that only runs smartctl, and the
+    # part that talks to the network, which becomes the user "nobody" without any capability.
+    # Every capability is dropped except SETUID/SETGID (for that split), SYS_RAWIO (SATA/SAS
+    # drives) and SYS_ADMIN (only for NVMe drives: remove that line if the host has none).
     read_only: true
     cap_drop:
       - ALL
     cap_add:
+      - SETUID                # to drop to an unprivileged user at start
+      - SETGID
       - SYS_RAWIO
       - SYS_ADMIN
     security_opt:
