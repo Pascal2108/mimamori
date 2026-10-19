@@ -33,7 +33,7 @@
   <h2>Missing security updates</h2>
   <div class="panel">
     {% if not h %}
-    <p class="empty">This agent does not report the host's packages. To see missing security updates, mount the host's package list read-only into the agent (see <span class="mono">volumes</span> in docker-compose.agent.yml), then recreate the agent container. This needs agent 0.2.2 or newer.</p>
+    <p class="empty">This agent does not report the host's packages. To see missing security updates, mount the host's package list read-only into the agent (see <span class="mono">volumes</span> in docker-compose.agent.yml), then recreate the agent container. This needs agent 0.3.0 or newer.</p>
     {% else %}
       {% if not check_enabled %}<div class="banner">The update check is off. Turn it on in <a href="{{ url_for('settings') }}#updates">Settings → Updates</a> to compare these packages with the OSV vulnerability database.</div>{% endif %}
       {% if h.error %}<div class="banner flash error">{{ h.error }}</div>{% endif %}

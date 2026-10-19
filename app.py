@@ -18,6 +18,7 @@ import datetime as dt
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import logging
 import os
@@ -40,7 +41,7 @@ from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from functools import cmp_to_key
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import agent as protocol
@@ -689,13 +690,16 @@ CHANNELS = ("Discord", "mail", "webhook")
 SEVERITIES = ("low", "middle", "high")
 # What each channel is sent, chosen per channel in Settings → Notifications:
 # topic -> (label, default). The defaults send everything that was sent before 0.2.2.
+# Shown as critical, medium, low. The keys stay high/middle/low: they are part of the webhook
+# payload ("severity", "topics") and of saved notification rules.
+SEVERITY_NAMES = {"high": "critical", "middle": "medium", "low": "low"}
 NOTIFY_TOPICS: dict[str, tuple[str, bool]] = {
-    "drive_high": ("Drive issues · high: Failing or missing", True),
-    "drive_middle": ("Drive issues · middle: Watch (sectors, wear)", True),
+    "drive_high": ("Drive issues · critical: Failing or missing", True),
+    "drive_middle": ("Drive issues · medium: Watch (sectors, wear)", True),
     "drive_low": ("Drive issues · low: Watch (temperature, cable CRC errors)", True),
     "recovery": ("Recoveries: issue resolved, drive back", True),
-    "updates_high": ("Missing updates · high", True),
-    "updates_middle": ("Missing updates · middle", True),
+    "updates_high": ("Missing updates · critical", True),
+    "updates_middle": ("Missing updates · medium", True),
     "updates_low": ("Missing updates · low", False),
     "agent": ("Agent offline or back online", True),
     "report": ("Weekly report", True),
@@ -710,6 +714,26 @@ def drive_topic(kind: str, level: str, metric: str = "") -> str:
     if level == "crit":
         return "drive_high"
     return "drive_low" if metric in LOW_METRICS else "drive_middle"
+
+
+def drive_rank(status: str, issues: dict) -> str | None:
+    """A drive's place in the common ranking, like its notifications: Failing or missing is
+    high, Watch is middle, or low when only the temperature or cable CRC errors cause it."""
+    if status in ("failing", "missing"):
+        return "high"
+    if status == "watch":
+        return "low" if issues and all(m in LOW_METRICS for m in issues) else "middle"
+    return None
+
+
+# The headline follows the worst finding, drives and updates alike
+POND = {None: "The pond is calm.", "low": "A light breeze on the pond.",
+        "middle": "Ripples on the pond.", "high": "The pond is restless."}
+
+
+def worst_rank(levels: Iterable[str | None]) -> str | None:
+    found = [lvl for lvl in levels if lvl]
+    return max(found, key=SEVERITIES.index) if found else None
 
 
 def topics_severity(topics: Sequence[str] | set[str] | None) -> str:
@@ -1207,6 +1231,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "notify_rules": {},  # channel -> topic -> bool; missing entries use NOTIFY_TOPICS
     # Off until turned on: it sends package lists to an outside service (api.osv.dev)
     "updates_check_enabled": False,
+    # Part of every session; logging out raises it, which ends every session at once. The
+    # session lives only in the signed cookie, so this is how the server can revoke it.
+    "session_generation": 0,
 }
 
 
@@ -1293,7 +1320,7 @@ class Monitor:
         if agent["offline_alerted"]:
             self.db.execute("UPDATE agents SET offline_alerted = 0 WHERE id = ?", (agent["id"],))
             self._alert(agent["id"], None, "agent_online", "ok",
-                        f"Agent {agent['name']} is back online", "Reports are coming in again.",
+                        f"{agent['name']} is back online", "Reports are coming in again.",
                         topics={"agent"})
         return {"scan_interval": int(self.setting("scan_interval_minutes")) * 60,
                 "heartbeat_interval": HEARTBEAT_SECONDS,
@@ -1696,7 +1723,7 @@ class Monitor:
                                  "AND last_seen IS NOT NULL AND last_seen < ?", (limit,)):
             self.db.execute("UPDATE agents SET offline_alerted = 1 WHERE id = ?", (agent["id"],))
             self._alert(agent["id"], None, "agent_offline", "crit",
-                        f"Agent {agent['name']} is offline",
+                        f"{agent['name']} stopped reporting",
                         f"No heartbeat since {self.clock(agent['last_seen'])}. "
                         "Its drives are not being checked.", topics={"agent"})
 
@@ -1768,34 +1795,34 @@ def build_report(monitor: Monitor) -> dict:
         "SELECT al.*, a.name AS host FROM alerts al LEFT JOIN agents a ON a.id = al.agent_id "
         "WHERE al.ts >= ? ORDER BY al.ts DESC", (since,))]
     attention = [d for d in drives if d["status"] != "healthy"]
-    # Missing updates: security updates per host, drive firmware with a known bug
-    updates, important = [], False
+    # One ranking for everything, like the overview: drives, security updates, firmware
+    levels = [drive_rank(d["status"], json.loads(d["issues"])) for d in attention]
+    updates = []
     for h in monitor.db.all("SELECT a.name, h.updates FROM hosts h JOIN agents a "
                             "ON a.id = h.agent_id ORDER BY a.name COLLATE NOCASE"):
         found = json.loads(h["updates"])
-        high = sum(1 for u in found if u["level"] == "high")
-        important = important or bool(high)
+        levels += [u["level"] for u in found]
         if found:
-            updates.append(f"{h['name']}: {len(found)} package{'s' if len(found) != 1 else ''} "
-                           f"with missing security updates" + (f", {high} high" if high else ""))
+            counts = ", ".join(f"{n} {SEVERITY_NAMES[lvl]}" for lvl in reversed(SEVERITIES)
+                               if (n := sum(1 for u in found if u["level"] == lvl)))
+            updates.append(f"{h['name']}: {len(found)} missing security "
+                           f"update{'s' if len(found) != 1 else ''} ({counts})")
     for d in drives:
         fw = json.loads(d["firmware_issue"])
         if fw:
-            important = important or fw["level"] == "high"
+            levels.append(fw["level"])
             updates.append(f"{d['model']} {d['device']} on {d['host']}: firmware update "
-                           f"recommended ({fw['level']})")
-    if not drives:
+                           f"recommended ({SEVERITY_NAMES[fw['level']]})")
+    worst = worst_rank(levels)
+    if not drives and not levels:
         headline = "No drives reported yet."
-    elif not attention and not important:
-        headline = "The pond is calm. Every drive is healthy."
-    elif not attention:
-        headline = "Ripples on the pond: important updates are missing."
+    elif worst is None:
+        headline = "The pond is calm. Every drive is healthy, no update is missing."
     else:
-        n = len(attention)
-        headline = f"{n} drive{'s' if n != 1 else ''} need{'s' if n == 1 else ''} attention." + (
-            " Important updates are missing." if important else "")
+        n = len(levels)
+        headline = f"{POND[worst]} {n} thing{'s' if n != 1 else ''} need{'s' if n == 1 else ''} attention."
     return {
-        "updates": updates, "important_updates": important,
+        "updates": updates, "worst": worst,
         "generated": int(time.time()), "since": since, "drives": drives, "alerts": alerts,
         "counts": {s: sum(1 for d in drives if d["status"] == s) for s in STATUS_ORDER},
         "warmest": max((d for d in drives if d["max_temp"] is not None),
@@ -1817,7 +1844,7 @@ def report_event(data: dict, public_url: str) -> dict:
         w = data["warmest"]
         fields["Warmest this week"] = f"{w['max_temp']} °C · {w['model']} on {w['host']}"
     level = "crit" if c["failing"] or c["missing"] else \
-        "warn" if c["watch"] or data["important_updates"] else "ok"
+        "warn" if c["watch"] or data["worst"] in ("high", "middle") else "ok"
     ev = make_event("report", level, f"Weekly report · {data['headline']}", "\n".join(lines),
                     fields=fields, url=f"{public_url}/report" if public_url else "")
     ev["html"] = _report_html(data, level)
@@ -1959,6 +1986,8 @@ AGENT_ID = protocol.AGENT_ID
 # Redirect targets: local paths only (no "//host", no scheme), so no open redirect
 LOCAL_PATH = re.compile(r"^/(?!/)[A-Za-z0-9/_\-]*$")
 RANGES = {"7": 7, "30": 30, "90": 90, "365": 365}
+# Model names of virtual disks, which have no SMART data of their own
+VIRTUAL_DISK = re.compile(r"QEMU|VBOX|VMware|Virtual ?Disk|Msft|Hyper-V|Xen", re.I)
 NUMBER_WORDS = ["No", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine"]
 WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 SCRYPT = {"n": 2**14, "r": 8, "p": 1, "dklen": 32}
@@ -1966,10 +1995,28 @@ AGENT_IMAGE = "ghcr.io/pascal2108/mimamori-agent:0"  # pinned to the major versi
 # Simple brute-force protection: max. 5 failed logins per address in 15 minutes.
 # There is no limit across all addresses: anyone could use it to keep the owner locked out.
 MAX_TRIES, WINDOW = 5, 15 * 60
+# A whole IPv6 /48 (65,536 networks of /64, common for business lines) gets 20 tries in all
+MAX_TRIES_48 = 20
+
+
+def limit_key(ip: str, prefix: int = 64) -> str:
+    """The key failures are counted under: the address, or for IPv6 its network (/64 by
+    default), since one device can use any address of its network."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped:
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.IPv6Network((addr, prefix), strict=False))
+    return str(addr)
 
 
 class RateLimiter:
     """Failures per key in a sliding window, shared between request threads."""
+
+    MAX_KEYS = 10000  # bounds the memory under a flood
 
     def __init__(self, limit: int, window: int):
         self.limit, self.window = limit, window
@@ -1985,8 +2032,11 @@ class RateLimiter:
 
     def hit(self, key: str) -> None:
         with self._lock:
-            if len(self._hits) > 10000:  # bound the memory under a flood
-                self._hits.clear()
+            if key not in self._hits and len(self._hits) >= self.MAX_KEYS:
+                # Forget the key whose last failure is the oldest. Never all at once: that
+                # would lift every lockout for whoever floods the list.
+                oldest = min(self._hits, key=lambda k: self._hits[k][-1] if self._hits[k] else 0)
+                del self._hits[oldest]
             self._hits[key].append(time.monotonic())
 
     def clear(self, key: str) -> None:
@@ -2057,7 +2107,9 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
     session_epoch = hmac.new(secret_key, b"epoch\0" + cfg.admin_user.encode() + b"\0"
                              + cfg.admin_password.encode(), hashlib.sha256).hexdigest()[:16]
     cfg.admin_password = ""  # only the hash stays in memory
+    session_lock = threading.Lock()
     login_limiter = RateLimiter(MAX_TRIES, WINDOW)
+    login_limiter_48 = RateLimiter(MAX_TRIES_48, WINDOW)
     agent_limiter = RateLimiter(30, 300)
     asset_version = _asset_version()
 
@@ -2105,7 +2157,8 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
     app.jinja_env.filters.update(
         time=fmt_time, ago=ago, bytes=human_bytes, kind=kind_label,
         serial=lambda s: "no serial" if s.startswith("no-serial:") else s,
-        num=lambda n: "–" if n is None else f"{n:,}")
+        num=lambda n: "–" if n is None else f"{n:,}",
+        sev=lambda level: SEVERITY_NAMES.get(level, level))
 
     def agent_is_online(agent: dict) -> bool:
         limit = int(monitor.setting("agent_offline_minutes")) * 60
@@ -2132,6 +2185,10 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
                           "SMTP password may be sent unencrypted."})
         return notes
 
+    def signed_in() -> bool:
+        return (session.get("user") == cfg.admin_user and session.get("epoch") == session_epoch
+                and session.get("gen") == monitor.setting("session_generation"))
+
     # security hooks -------------------------------------------------------
     public = {"login", "static", "health", "favicon", "agent_heartbeat", "agent_report"}
     agent_api = {"agent_heartbeat", "agent_report"}
@@ -2141,8 +2198,7 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         endpoint = request.endpoint or ""
         if endpoint in agent_api:
             return None
-        if endpoint not in public and (session.get("user") != cfg.admin_user
-                                       or session.get("epoch") != session_epoch):
+        if endpoint not in public and not signed_in():
             session.clear()
             if request.method == "GET":
                 return redirect(url_for("login", next=request.path))
@@ -2172,11 +2228,15 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         resp.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
         if request.endpoint != "static":
             resp.headers["Cache-Control"] = "no-store"
+        # Browsers then use only HTTPS for this address for a year. Not with UNSAFE_HTTP,
+        # where plain HTTP is wanted on purpose and would stop working.
+        if request.is_secure and not cfg.unsafe_http:
+            resp.headers["Strict-Transport-Security"] = "max-age=31536000"
         return resp
 
     @app.context_processor
     def common() -> dict:
-        logged_in = session.get("user") == cfg.admin_user
+        logged_in = signed_in()
         last_ts = db.one("SELECT MAX(last_report) AS t FROM agents")["t"] if logged_in else None
         interval = int(monitor.setting("scan_interval_minutes")) * 60
         return {
@@ -2207,7 +2267,8 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         error_msg = ""
         if request.method == "POST":
             ip = client_ip()
-            if login_limiter.blocked(ip):
+            key, wide = limit_key(ip), limit_key(ip, 48)
+            if login_limiter.blocked(key) or login_limiter_48.blocked(wide):
                 error_msg = "Too many failed attempts. Wait 15 minutes."
             else:
                 user = request.form.get("username", "")[:128]
@@ -2216,7 +2277,7 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
                 ok_pw = hmac.compare_digest(
                     hashlib.scrypt(password.encode(), salt=salt, **SCRYPT), password_hash)
                 if ok_user and ok_pw:
-                    login_limiter.clear(ip)
+                    login_limiter.clear(key)
                     log.info("Login from %s", ip)
                     if not request.is_secure and not cfg.unsafe_http and not is_local_host():
                         log.warning("Login over plain HTTP: the browser will not keep the session "
@@ -2225,18 +2286,25 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
                     session.clear()
                     session.permanent = True
                     session.update(user=cfg.admin_user, epoch=session_epoch,
+                                   gen=monitor.setting("session_generation"),
                                    csrf=secrets.token_urlsafe(32))
                     target = request.args.get("next", "")
                     return redirect(target if LOCAL_PATH.match(target) else url_for("overview"))
-                login_limiter.hit(ip)
+                # No sleep here: it would hold one of the few server threads, and the
+                # lockout already limits the guessing
+                login_limiter.hit(key)
+                if wide != key:  # IPv6 only
+                    login_limiter_48.hit(wide)
                 log.warning("Failed login from %s", ip)
-                time.sleep(1)
                 error_msg = "Wrong user name or password."
         http_hint = not (cfg.unsafe_http or request.is_secure or is_local_host())
         return render_template("login.html", error=error_msg, http_hint=http_hint)
 
     @app.post("/logout")
     def logout():
+        # Ends every session, also a copy of this cookie taken earlier
+        with session_lock:
+            db.set_setting("session_generation", int(monitor.setting("session_generation")) + 1)
         session.clear()
         return redirect(url_for("login"))
 
@@ -2253,7 +2321,8 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
     # A message that fails counts against the sender's address, like a failed login.
     def agent_message(kind: str) -> tuple[dict, dict, Callable[[dict], Any]]:
         ip = client_ip()
-        if agent_limiter.blocked(ip):
+        key = limit_key(ip)
+        if agent_limiter.blocked(key):
             abort(429)
         agent_id = request.headers.get("X-Mimamori-Agent", "")
         row = db.one("SELECT * FROM agents WHERE id = ?", (agent_id,)) \
@@ -2265,7 +2334,7 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
                 server_keys, protocol.b64d(row["public_key"], 32), agent_id, kind,
                 request.get_json(silent=True))
         except protocol.ProtocolError:
-            agent_limiter.hit(ip)
+            agent_limiter.hit(key)
             log.warning("Agent message from %s rejected: unknown agent or wrong key", ip)
             abort(401)
         if abs(time.time() * 1000 - ts) > protocol.MAX_CLOCK_SKEW_MS:
@@ -2278,7 +2347,7 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
                 "UPDATE agents SET last_message = ? WHERE id = ? AND last_message < ?",
                 (ts, agent_id, ts)).rowcount == 1
         if not accepted:
-            agent_limiter.hit(ip)
+            agent_limiter.hit(key)
             log.warning("Agent %s: a message came twice or out of order and was rejected",
                         row["name"])
             abort(401)
@@ -2319,6 +2388,12 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             d["latest"] = latest.get(d["id"], {})
             d["issues"] = json.loads(d["issues"])
             d["fw"] = json.loads(d["firmware_issue"])
+            s = d["latest"]
+            # Answers, but without any health value: virtual disks, some USB enclosures
+            d["no_smart"] = bool(s) and d["status"] != "missing" and not d["standby"] and all(
+                s.get(k) is None for k in ("temp", "power_on_hours", "wear", "reallocated",
+                                           "media_errors"))
+            d["virtual"] = bool(VIRTUAL_DISK.search(d["model"] or ""))
             d["spark"] = "" if d["temp_ignored"] else sparkline(history.get(d["id"], []))
             if d["temp_ignored"] and d["latest"]:  # faulty sensor: not shown, not "warmest"
                 d["latest"]["temp"] = None
@@ -2345,57 +2420,61 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
                 "update_total": len(updates),
                 "firmware_issues": sum(1 for d in drives if d.get("fw"))}
 
-    def headline(agents: list[dict], drives: list[dict]) -> tuple[str, str]:
-        def count(n: int) -> str:
-            return NUMBER_WORDS[n] if n < len(NUMBER_WORDS) else str(n)
+    def attention_items(agents: list[dict], drives: list[dict]) -> list[dict]:
+        """Everything that needs you, in one ranking (high/middle/low, shown as critical/
+        medium/low), worst first. Drive problems are red when critical, updates gold."""
+        items: list[dict] = []
 
-        # Important updates: security updates rated high, firmware with a serious known bug
-        update_hosts = [a for a in agents if a["update_counts"]["high"]]
-        firmware = [d for d in drives if d["fw"].get("level") == "high"]
-        if not drives and not update_hosts:
-            return "The pond is still.", "No drives have reported yet."
-        attention = [d for d in drives if d["status"] != "healthy"]
-        said = []
-        if attention:
-            n = len(attention)
-            hosts = {d["agent_id"] for d in attention}
-            where = ""
-            if len(hosts) == 1 and len(agents) > 1:
-                where = " on " + next(a["name"] for a in agents if a["id"] in hosts)
-            said.append(f"{count(n)} drive{'s' if n != 1 else ''}{where} need{'s' if n == 1 else ''} you.")
-        if len(update_hosts) == 1:
-            n = update_hosts[0]["update_counts"]["high"]
-            said.append(f"{update_hosts[0]['name']} is missing {'an' if n == 1 else count(n).lower()} "
-                        f"important security update{'s' if n != 1 else ''}.")
-        elif update_hosts:
-            said.append(f"{count(len(update_hosts))} hosts are missing important security updates.")
-        if firmware:
-            n = len(firmware)
-            said.append(f"{count(n)} drive{'s' if n != 1 else ''} need{'s' if n == 1 else ''} "
-                        "a firmware update.")
-        if not said:
-            return "The pond is calm.", ""
-        if not attention:
-            lead = "Ripples on the pond."
-        elif len(attention) < len(drives) and not update_hosts and not firmware:
-            lead = "The pond is mostly calm."
-        else:
-            lead = "The pond is restless."
-        return lead, " ".join(said)
+        def add(level: str, kind: str, count: int, host: str, text: str, url: str) -> None:
+            tone = "quiet" if level == "low" else \
+                "crit" if level == "high" and kind in ("drive", "agent") else "warn"
+            items.append({"level": level, "kind": kind, "count": count, "host": host,
+                          "text": text, "url": url, "tone": tone})
+
+        names = {a["id"]: a["name"] for a in agents}
+        for a in agents:
+            url = url_for("host", agent_id=a["id"])
+            if a["last_seen"] and not a["online"]:
+                add("high", "agent", 1, a["name"], f"{a['name']} stopped reporting", url)
+            for level in reversed(SEVERITIES):
+                if n := a["update_counts"][level]:
+                    add(level, "updates", n, a["name"], f"{a['name']}: {n} {SEVERITY_NAMES[level]} "
+                        f"security update{'s' if n != 1 else ''} missing", url)
+        for d in drives:
+            host, url = names.get(d["agent_id"], ""), url_for("drive", drive_id=d["id"])
+            if level := drive_rank(d["status"], d["issues"]):
+                add(level, "drive", 1, host, f"{drive_name(d)} on {host}: "
+                    f"{d['summary'] or d['status']}", url)
+            if d["fw"]:
+                add(d["fw"]["level"], "firmware", 1, host,
+                    f"{drive_name(d)} on {host}: firmware update recommended", url)
+        items.sort(key=lambda i: -SEVERITIES.index(i["level"]))
+        return items
+
+    def attention_summary(items: list[dict]) -> dict:
+        tones = {i["tone"] for i in items}
+        return {
+            "total": sum(i["count"] for i in items),
+            "worst": items[0]["level"] if items else None,
+            "tone": "crit" if "crit" in tones else "warn" if "warn" in tones else "quiet",
+            "levels": {lvl: sum(i["count"] for i in items if i["level"] == lvl)
+                       for lvl in reversed(SEVERITIES)},
+            "kinds": {k: sum(i["count"] for i in items if i["kind"] == k)
+                      for k in ("updates", "drive", "firmware", "agent")},
+            "hosts": list(dict.fromkeys(i["host"] for i in items if i["host"])),
+        }
 
     @app.get("/")
     def overview():
         agents, drives = drive_cards()
-        lead, attention = headline(agents, drives)
+        items = attention_items(agents, drives)
+        att = attention_summary(items)
+        lead = POND[att["worst"]] if drives or items else "The pond is still."
         warm = [d for d in drives if d["latest"].get("temp") is not None and d["status"] != "missing"]
-        updates = {"packages": sum(a["update_total"] for a in agents),
-                   "high": sum(a["update_counts"]["high"] for a in agents),
-                   "firmware": sum(1 for d in drives if d["fw"]),
-                   "firmware_high": sum(1 for d in drives if d["fw"].get("level") == "high"),
-                   "checked": any(a["updates_checked"] for a in agents)}
         return render_template(
-            "overview.html", agents=agents, drives=drives, lead=lead, attention=attention,
-            updates=updates,
+            "overview.html", agents=agents, drives=drives, lead=lead, items=items, att=att,
+            offline=sum(1 for a in agents if a["last_seen"] and not a["online"]),
+            no_smart=[d for d in drives if d["no_smart"]],
             refresh=any(a["update_progress"] is not None or a["update_queued"] for a in agents),
             counts={s: sum(1 for d in drives if d["status"] == s) for s in STATUS_ORDER},
             warmest=max(warm, key=lambda d: d["latest"]["temp"], default=None),

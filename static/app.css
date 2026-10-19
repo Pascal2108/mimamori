@@ -129,12 +129,48 @@ main { max-width: 1240px; margin: 0 auto; padding: 28px 24px 64px; }
 .tile .label { color: var(--ash); font-size: 12.5px; }
 .tile .value { font-size: 26px; margin: 4px 0 2px; }
 .tile .sub { color: var(--ash); font-size: 12px; }
+.tiles.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.tile .value .of { color: var(--ash); font-size: 16px; }
+.attention-tile .sub { display: flex; flex-wrap: wrap; gap: 2px 12px; align-items: center; }
+.attention-tile .sub > span { white-space: nowrap; }
+.attention-tile .sub .dot { width: 6px; height: 6px; margin-right: 2px; }
+.attention-tile.warn { border-color: #5e4e25; }
+.attention-tile.crit { border-color: #6b3237; }
+
+/* the line under the headline, opens to the ranked list */
+.attention { margin: -12px 0 24px; color: var(--paper); font-size: 14px; }
+.attention summary { cursor: pointer; display: flex; align-items: baseline; gap: 8px;
+  list-style: none; color: var(--ash); }
+.attention summary .dot { align-self: center; }
+.attention summary::-webkit-details-marker { display: none; }
+/* a small chevron after the text, pointing down when closed */
+.attention summary .what::after {
+  content: ""; display: inline-block; width: 6px; height: 6px; margin: 0 0 3px 10px;
+  border-right: 1.5px solid var(--ash); border-bottom: 1.5px solid var(--ash); transform: rotate(45deg);
+}
+.attention[open] summary .what::after { transform: rotate(-135deg); margin-bottom: -1px; }
+.attention summary b { color: var(--paper); font-weight: 500; }
+.attention ul { list-style: none; margin: 12px 0 0; padding: 12px 16px; display: grid; gap: 8px;
+  background: var(--slate); border: 1px solid var(--line-soft); border-radius: var(--radius); }
+.attention li { display: flex; gap: 10px; align-items: baseline; font-size: 13.5px; }
+.attention li .sev { flex: none; min-width: 72px; text-align: center; }
+.attention li a { color: var(--paper); }
+
+.chip { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 1px 10px;
+  font-size: 12px; font-weight: 400; border: 1px solid var(--line); }
+.chip .dot { width: 6px; height: 6px; }
+.chip.warn { color: var(--gold); border-color: #6a5626; background: #2a2414; }
+.chip.quiet { color: var(--ash); }
+a.chip:hover { text-decoration: none; filter: brightness(1.15); }
+.card-note { color: var(--ash); font-size: 12.5px; line-height: 1.5; margin: 0 0 12px;
+  padding: 10px 12px; border: 1px dashed var(--line); border-radius: 8px; }
 
 .grid-main { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 20px; align-items: start; }
 .grid-main > *, .grid-detail > *, .tiles > *, .cards > *, .charts > * { min-width: 0; }
 .host { margin-bottom: 28px; }
 .host-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
-.host-head h2 span { color: var(--ash); font-size: 13px; }
+.host-head h2 { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+.host-head h2 .location { color: var(--ash); font-size: 13px; font-weight: 400; }
 .presence { color: var(--ash); font-size: 12.5px; display: flex; align-items: center; gap: 6px; }
 
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--ash); flex: none; }
@@ -175,7 +211,7 @@ a.card:hover { border-color: var(--line); text-decoration: none; }
 .badge.failing { background: #3a1f25; color: var(--hi); }
 .badge .dot { width: 6px; height: 6px; }
 .badges { display: inline-flex; flex-wrap: wrap; gap: 6px; }
-.badge.fw-high { background: #3a1f25; color: var(--hi); }
+.badge.fw-high { background: #3d3214; color: var(--gold); }
 .badge.fw-middle { background: #33301c; color: var(--gold); }
 
 .panel {
@@ -294,8 +330,11 @@ a.host-caption:hover { text-decoration: none; color: var(--paper); }
   letter-spacing: .06em; text-transform: uppercase; font-weight: 500;
   background: #1c2a40; color: var(--ash);
 }
-.sev.high { background: #3a1f25; color: var(--hi); }
-.sev.middle { background: #33301c; color: var(--gold); }
+/* the ranking: updates and firmware gold, critical drive problems red */
+.sev.high { background: #3d3214; color: var(--gold); }
+.sev.high.drive, .sev.high.agent { background: #3a1f25; color: var(--hi); }
+.sev.middle { background: #2b2a1e; color: #d8bd73; }
+.sev.low { background: #1c2a40; color: var(--ash); }
 .tile .value.small-value { font-size: 16px; overflow-wrap: anywhere; }
 .inline-presence { display: inline-flex; }
 details.vulns summary { cursor: pointer; font-size: 13px; }
@@ -311,12 +350,8 @@ details summary.btn::-webkit-details-marker { display: none; }
 .pager { display: flex; justify-content: space-between; margin-top: 12px; }
 
 /* responsive ------------------------------------------------------- */
-@media (min-width: 1101px) {
-  .tiles.seven { grid-template-columns: repeat(7, minmax(0, 1fr)); }
-}
 @media (max-width: 1100px) {
   .tiles { grid-template-columns: repeat(3, 1fr); }
-  .tiles.seven { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .cards { grid-template-columns: repeat(2, 1fr); }
   .grid-main, .grid-detail { grid-template-columns: 1fr; }
 }
@@ -331,9 +366,9 @@ details summary.btn::-webkit-details-marker { display: none; }
   .tile .value { font-size: 20px; order: -1; margin: 0; }
   .tile .sub { display: none; }
   .tile.wide-only { display: none; }
-  .tiles.seven { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-  .tile.updates { grid-column: 1 / -1; flex-direction: row; align-items: baseline; gap: 8px; }
-  .tile.updates .sub { display: block; margin-left: auto; }
+  .tiles.four { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .tiles.four .tile .sub { display: block; }
+  .attention summary { font-size: 13px; }
   .hosts-cards { display: none; }
   .rows { display: block; }
   .charts { grid-template-columns: 1fr; }

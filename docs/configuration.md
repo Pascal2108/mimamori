@@ -44,6 +44,7 @@ The agent is configured in `docker-compose.agent.yml` and `agent.env`:
 |---|---|---|
 | `SERVER_URL` | required | Address of mimamori as the agent's host reaches it: the HTTPS address of the proxy, or `http://mimamori:8000` inside the server's Docker network |
 | `AGENT_KEY` | required | The key from Settings → Agents; belongs into `agent.env` |
+| `AGENT_KEY_FILE` | – | Read the key from this file instead, e.g. a Docker secret (see the comments in `docker-compose.agent.yml`). Unlike `AGENT_KEY`, it does not show in `docker inspect`. The file can be readable by root only |
 | `AGENT_NAME` | host name of the container | Name of the host, shown on the page; set it, since the container's own host name is a random ID |
 | `DEVICES` | all listed devices | Only check these, e.g. `/dev/sda,/dev/sdb:sat`; after a colon, a `smartctl -d` type for drives behind USB bridges or RAID controllers |
 | `LOG_LEVEL` | `INFO` | `DEBUG` for more detail |
@@ -64,7 +65,7 @@ With `WEBHOOK_URL` set, mimamori sends every alert as a JSON `POST`:
  "url": "https://mimamori.example.com/drive/3", "ts": 1792270094}
 ```
 
-`kind` is one of `new_issue`, `worsened`, `resolved`, `missing`, `back`, `agent_offline`, `agent_online`, `updates`, `firmware`, `report` and `test`; `level` is `crit`, `warn`, `info` or `ok`. Alerts also carry `severity` (`low`, `middle`, `high`, or empty) and `topics`, the rule names from Settings → Notifications (e.g. `["drive_high"]`, `["updates_middle"]`). Only alerts whose topic you allowed for the webhook are sent to it.
+`kind` is one of `new_issue`, `worsened`, `resolved`, `missing`, `back`, `agent_offline`, `agent_online`, `updates`, `firmware`, `report` and `test`; `level` is `crit`, `warn`, `info` or `ok`. Alerts also carry `severity` (`low`, `middle`, `high`, or empty; the page shows them as low, medium and critical) and `topics`, the rule names from Settings → Notifications (e.g. `["drive_high"]`, `["updates_middle"]`). Only alerts whose topic you allowed for the webhook are sent to it.
 
 With `WEBHOOK_SECRET` set, every request carries the headers `X-Mimamori-Timestamp` and `X-Mimamori-Signature: sha256=<hex>`, the HMAC-SHA256 of `<timestamp>.<raw body>` with the secret as key. Check the signature with a constant-time comparison and reject timestamps older than a few minutes.
 

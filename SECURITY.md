@@ -97,15 +97,16 @@ What remains:
 
 - The collector is root with access to the listed drives. A flaw in smartctl itself, triggered by a manipulated drive, would run with those rights. That needs physical access to the host or a malicious drive.
 - `SYS_ADMIN` is a broad capability. Leave it out if the host has no NVMe drive.
-- The agent's private key is in `agent.env` on the host. Whoever can read that file can send reports in the agent's name (not more: see above). Keep the file readable only by root (`chmod 600 agent.env`), and create a new key under Settings → Agents if it may have leaked.
+- The agent's private key is in `agent.env` on the host. Whoever can read that file can send reports in the agent's name (not more: see above). Keep the file readable only by root (`chmod 600 agent.env`), and create a new key under Settings → Agents if it may have leaked. With `AGENT_KEY_FILE` (see `docker-compose.agent.yml`) the key is not in the container's environment either, where `docker inspect` would show it.
 
 ### Security of the server
 
 The server is separate from the agents in every respect: it holds no key that lets anyone act as an agent, and an agent can only ever affect its own drives.
 
 - **Hardened container**: non-root, read-only, every capability dropped, `no-new-privileges`, memory and process limits.
-- **The page**: one login with a lockout after five failed attempts per address, a session cookie that only travels over HTTPS (`__Host-`, `HttpOnly`, `SameSite=Strict`), a CSRF token on every form, a strict Content Security Policy without any JavaScript, and every value escaped. Without HTTPS the login does not work, unless you allow it with `UNSAFE_HTTP`.
+- **The page**: one login with a lockout after five failed attempts per address (for IPv6 per /64 network, and at most 20 per /48), a session cookie that only travels over HTTPS (`__Host-`, `HttpOnly`, `SameSite=Strict`), a CSRF token on every form, a strict Content Security Policy without any JavaScript, and every value escaped. Logging out ends every session, also copies of the cookie. Over HTTPS the server sends HSTS, so browsers keep to HTTPS. Without HTTPS the login does not work, unless you allow it with `UNSAFE_HTTP`.
 - **Agent messages are hostile input**: every message must carry a valid signature before it is even decrypted; every value from smartctl is type-checked, bounded and truncated. An agent can only change its own drives' data, may send at most one report every 20 seconds, and can trigger at most 20 notifications per hour; more alerts are recorded but not sent, so a compromised host cannot flood your Discord or mailbox.
 - **Secrets** stay in `secrets.env` and in memory; the admin password is kept only as a hash. Logs never contain passwords, keys or webhook addresses.
+- **Supply chain**: the images install their Python packages only in the exact versions and with the hashes in `requirements.txt` and `requirements-agent.txt`; GitHub Actions are pinned to commit hashes; the images are rebuilt every week.
 
 What remains: mimamori has one shared login without two-factor authentication and has not been audited, which is why it belongs into a private network, not on the internet.

@@ -15,6 +15,7 @@ services:
       AGENT_NAME: docker-host     # CHANGE: name of this host, as the page shows it
       # DEVICES: /dev/sda,/dev/nvme0   # (optional) check only these; after a colon a smartctl -d type, e.g. /dev/sdb:sat
       # LOG_LEVEL: INFO           # (optional) DEBUG for more detail in the log
+      # AGENT_KEY_FILE: /run/secrets/agent_key   # (optional) see "secrets" below
     # CHANGE: every drive to watch (list them with: ls /dev/sd? /dev/nvme?), each written as
     # /dev/sdX:/dev/sdX:r. The :r lets the container only read the drive, never write to it.
     devices:
@@ -27,14 +28,20 @@ services:
     #   - /etc/os-release:/host/etc/os-release:ro
     #   - /var/lib/dpkg:/host/var/lib/dpkg:ro
     #   - /lib/apk/db:/host/lib/apk/db:ro
+    # (optional) Keep AGENT_KEY out of the environment, where "docker inspect" shows it: put
+    # the key alone into a file agent_key next to this one (chmod 600 agent_key), remove it
+    # from agent.env, and remove the # in front of AGENT_KEY_FILE above, these two lines and
+    # the "secrets" lines at the end.
+    # secrets:
+    #   - agent_key
     tmpfs:
       - /tmp:size=1m,noexec,nosuid,nodev
     # Security hardening, leave as it is. Reading raw drives needs root inside the container,
     # so the agent splits itself at start: a small root part that only runs smartctl, and the
     # part that talks to the network, which becomes the user "nobody" without any capability.
-    # Every capability is dropped except SETUID/SETGID (for that split; the root part gives them
-    # up right after it), SYS_RAWIO (SATA/SAS
-    # drives) and SYS_ADMIN (only for NVMe drives: remove that line if the host has none).
+    # Every capability is dropped except SETUID/SETGID (for that split; the root part gives
+    # them up right after it), SYS_RAWIO (SATA/SAS drives) and SYS_ADMIN (only for NVMe
+    # drives: remove that line if the host has none).
     read_only: true
     cap_drop:
       - ALL
@@ -56,3 +63,7 @@ services:
 #   proxy:
 #     external: true
 #     name: nginx_reverse_proxy   # the Docker network of the mimamori server
+
+# secrets:
+#   agent_key:
+#     file: ./agent_key

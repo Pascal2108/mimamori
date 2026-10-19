@@ -55,7 +55,7 @@ On every host with drives to watch, including the server's host if it has some:
 
 ## Using it
 
-The **overview** shows every host with its drives, and its headline whether anything needs you. Click a drive for its history and thresholds, a host's name for its packages and updates. **Check now** makes every agent check within a minute.
+The **overview** shows every host with its drives. Drive problems and missing updates are ranked together as critical, medium or low, and the headline follows the worst of them. Click a drive for its history and thresholds, a host's name for its packages and updates. **Check now** makes every agent check within a minute.
 
 | State | When |
 |---|---|

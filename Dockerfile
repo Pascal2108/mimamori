@@ -11,9 +11,11 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 COPY requirements.txt .
+# Exact versions with their hashes, generated from requirements.in with pip-compile: a package
+# that was changed on its way here is refused.
 # pip is not needed once the packages are in, and its own bundled libraries only add
 # attack surface and findings in vulnerability scans
-RUN pip install --no-cache-dir -r requirements.txt \
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt \
  && pip uninstall -y pip \
  && rm -rf "$(python -c 'import ensurepip, os; print(os.path.dirname(ensurepip.__file__))')"
 

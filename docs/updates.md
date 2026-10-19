@@ -4,9 +4,9 @@ mimamori checks two things besides the drives' health: missing security updates 
 
 ## Host packages
 
-An agent from 0.2.2 on reports the host's installed packages when its package list is mounted. To set that up, remove the `#` in front of the `volumes:` lines for your system in `docker-compose.agent.yml` (Debian, Ubuntu and Proxmox: `os-release` and `dpkg`; Alpine: `os-release` and `apk`), recreate the agent, and turn the check on under **Settings → Updates** on the page.
+An agent from 0.3.0 on reports the host's installed packages when its package list is mounted. To set that up, remove the `#` in front of the `volumes:` lines for your system in `docker-compose.agent.yml` (Debian, Ubuntu and Proxmox: `os-release` and `dpkg`; Alpine: `os-release` and `apk`), recreate the agent, and turn the check on under **Settings → Updates** on the page.
 
-The server looks the packages up in the [OSV database](https://osv.dev), which carries the security trackers of Debian, Ubuntu and Alpine, twice a day and right after the list changes. A package counts as missing an update when a known vulnerability affects the installed version and the distribution has released a fixed version. Each one is rated by the distribution's own priority (Ubuntu priority, Debian urgency) or else by its CVSS score: **high** from 7.0, **middle** from 4.0, **low** below; unrated ones count as middle. Vulnerabilities without a fixed version are only counted.
+The server looks the packages up in the [OSV database](https://osv.dev), which carries the security trackers of Debian, Ubuntu and Alpine, twice a day and right after the list changes. A package counts as missing an update when a known vulnerability affects the installed version and the distribution has released a fixed version. Each one is rated by the distribution's own priority (Ubuntu priority, Debian urgency) or else by its CVSS score: **critical** from 7.0, **medium** from 4.0, **low** below; unrated ones count as medium. Vulnerabilities without a fixed version are only counted.
 
 The host's page (click its name on the overview) lists every package with the version that fixes it, the vulnerabilities, the running kernel and all installed packages. While a check runs, the host's page and the overview show how far it has got in percent. The first check of a host takes a few minutes, later ones only fetch what changed.
 
@@ -22,4 +22,6 @@ There is no public database of drive firmware, so a drive without a listed bug m
 
 ## Notifications
 
-A new finding raises one alert per host or drive, rated like above. An important one (high) also shows in the headline of the overview. Under **Settings → Notifications** you choose for each channel which alerts it gets: drive issues (high: Failing or missing; middle: Watch for sectors and wear; low: Watch for temperature and cable CRC errors), missing updates (high, middle, low; low is off by default), recoveries, agent offline and the weekly report.
+Drive problems and missing updates share one ranking: **critical** (a Failing or missing drive, an agent offline, a critical update or firmware bug), **medium** (Watch for sectors or wear, a medium update) and **low** (Watch for temperature or cable CRC errors, a low update). Everything counts together on the overview, and its headline follows the worst: *The pond is calm*, *A light breeze on the pond* (low), *Ripples on the pond* (medium), *The pond is restless* (critical).
+
+A new finding raises one alert per host or drive. Under **Settings → Notifications** you choose for each channel which ranks it gets, for drive issues and missing updates separately (low updates are off by default), plus recoveries, agent offline and the weekly report.

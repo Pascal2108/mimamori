@@ -3,18 +3,21 @@
 {%- endmacro %}
 
 {% macro severity(level) -%}
-<span class="sev {{ level }}">{{ level }}</span>
+<span class="sev {{ level }}">{{ level|sev }}</span>
+{%- endmacro %}
+
+{# Updates and firmware are gold, whatever their rank; red stays with failing drives #}
+{% macro alert_tone(a) -%}
+{%- if a.kind in ('missing', 'agent_offline') %}quiet{% elif a.kind in ('updates', 'firmware') %}{{ 'quiet' if a.level == 'info' else 'warn' }}{% else %}{{ {'crit': 'crit', 'warn': 'warn', 'ok': 'ok'}.get(a.level, 'quiet') }}{% endif -%}
 {%- endmacro %}
 
 {% macro alert_kind(a) -%}
-{%- set cls = {'crit': 'crit', 'warn': 'warn', 'ok': 'ok'}.get(a.level, 'quiet') -%}
-{%- if a.kind in ('missing', 'agent_offline') %}{% set cls = 'quiet' %}{% endif -%}
-<span class="alert-kind {{ cls }}">{{ {'new_issue': 'New issue', 'worsened': 'Worsened', 'resolved': 'Resolved', 'missing': 'Missing', 'back': 'Back', 'agent_offline': 'Agent offline', 'agent_online': 'Agent online', 'updates': 'Missing updates', 'firmware': 'Firmware'}.get(a.kind, a.kind) }}</span>
+<span class="alert-kind {{ alert_tone(a) }}">{{ {'new_issue': 'New issue', 'worsened': 'Worsened', 'resolved': 'Resolved', 'missing': 'Missing', 'back': 'Back', 'agent_offline': 'Agent offline', 'agent_online': 'Agent online', 'updates': 'Security update', 'firmware': 'Firmware'}.get(a.kind, a.kind) }}</span>
 {%- endmacro %}
 
 {% macro alert_dot(a) -%}
-{%- if a.kind in ('missing', 'agent_offline') %}<span class="dot missing"></span>
-{%- else %}<span class="dot {{ a.level }}"></span>{% endif -%}
+{%- set tone = alert_tone(a) -%}
+<span class="dot {{ 'missing' if tone == 'quiet' else tone }}"></span>
 {%- endmacro %}
 
 {% macro alert_item(a, show_host=true) -%}

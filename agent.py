@@ -590,9 +590,19 @@ def run() -> int:
     ALIVE_FILE.unlink(missing_ok=True)
     url = os.environ.get("SERVER_URL", "").strip()
     agent_key = os.environ.pop("AGENT_KEY", "").strip()
+    # The key from a file instead (e.g. a Docker secret): unlike an environment variable it
+    # does not show in "docker inspect". Read now, as root, so the file can be root-only.
+    key_file = os.environ.get("AGENT_KEY_FILE", "").strip()
+    if not agent_key and key_file:
+        try:
+            with open(key_file, encoding="ascii") as f:
+                agent_key = f.read(1024).strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            reason = getattr(exc, "strerror", None) or type(exc).__name__
+            return _idle(f"AGENT_KEY_FILE {key_file[:200]!r} cannot be read ({reason}).")
     if not url or not agent_key:
-        return _idle("SERVER_URL and AGENT_KEY must be set in agent.env. Add an agent under "
-                     "Settings → Agents on the mimamori page to get them.")
+        return _idle("SERVER_URL and AGENT_KEY (or AGENT_KEY_FILE) must be set. Add an agent "
+                     "under Settings → Agents on the mimamori page to get them.")
     try:
         client = AgentClient(url, agent_key)
     except ValueError as exc:

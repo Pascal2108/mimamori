@@ -33,7 +33,7 @@ services:
     volumes:
       - data:/data                # history, settings and agents
     tmpfs:
-      - /tmp:size=16m
+      - /tmp:size=16m,noexec,nosuid,nodev
     # Security hardening, leave as it is
     read_only: true
     cap_drop:
