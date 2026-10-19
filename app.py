@@ -31,11 +31,14 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
+from functools import cmp_to_key
 from pathlib import Path
 from typing import Any, Callable, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -124,8 +127,8 @@ def load_config() -> Config:
                      "in secrets.env, then start the container again.")
         raise SystemExit(1)
     if len(password) < MIN_PASSWORD_LENGTH:
-        log.warning("ADMIN_PASSWORD is shorter than %d characters. Choose a longer one; the page "
-                    "says so too until you do.", MIN_PASSWORD_LENGTH)
+        log.warning("ADMIN_PASSWORD is shorter than %d characters. Choose a longer one in "
+                    "secrets.env and recreate the container.", MIN_PASSWORD_LENGTH)
 
     security = env("SMTP_SECURITY", "starttls").lower()
     if security not in {"starttls", "ssl", "none"}:
@@ -555,12 +558,33 @@ CREATE TABLE IF NOT EXISTS alerts (
 CREATE INDEX IF NOT EXISTS alerts_ts ON alerts (ts);
 CREATE INDEX IF NOT EXISTS alerts_drive ON alerts (drive_id, ts);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+-- Added in 0.2.2. New tables are created in older databases as well, since this script runs
+-- at every start; new columns of existing tables go into MIGRATIONS.
+CREATE TABLE IF NOT EXISTS hosts (
+    agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+    os_info TEXT NOT NULL DEFAULT '{}',
+    packages TEXT NOT NULL DEFAULT '[]',
+    packages_hash TEXT NOT NULL DEFAULT '',
+    reported INTEGER NOT NULL,
+    updates TEXT NOT NULL DEFAULT '[]',
+    unfixed INTEGER NOT NULL DEFAULT 0,
+    checked INTEGER,
+    error TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS vulns (
+    id TEXT PRIMARY KEY,
+    modified TEXT NOT NULL,
+    data TEXT NOT NULL,
+    fetched INTEGER NOT NULL
+);
 """
 
 
 # (table, column, definition), applied in order to databases that lack the column.
 # New columns go here instead of into SCHEMA, so databases of older versions get them too.
-MIGRATIONS: list[tuple[str, str, str]] = []
+MIGRATIONS: list[tuple[str, str, str]] = [
+    ("drives", "firmware_issue", "TEXT NOT NULL DEFAULT '{}'"),
+]
 
 
 class Database:
@@ -651,7 +675,39 @@ ALERT_LABELS = {
     "new_issue": "New issue", "worsened": "Worsened", "resolved": "Resolved",
     "missing": "Missing", "back": "Back", "agent_offline": "Agent offline",
     "agent_online": "Agent online", "test": "Test", "report": "Weekly report",
+    "updates": "Missing updates", "firmware": "Firmware",
 }
+CHANNELS = ("Discord", "mail", "webhook")
+SEVERITIES = ("low", "middle", "high")
+# What each channel is sent, chosen per channel in Settings → Notifications:
+# topic -> (label, default). The defaults send everything that was sent before 0.2.2.
+NOTIFY_TOPICS: dict[str, tuple[str, bool]] = {
+    "drive_high": ("Drive issues · high: Failing or missing", True),
+    "drive_middle": ("Drive issues · middle: Watch (sectors, wear)", True),
+    "drive_low": ("Drive issues · low: Watch (temperature, cable CRC errors)", True),
+    "recovery": ("Recoveries: issue resolved, drive back", True),
+    "updates_high": ("Missing updates · high", True),
+    "updates_middle": ("Missing updates · middle", True),
+    "updates_low": ("Missing updates · low", False),
+    "agent": ("Agent offline or back online", True),
+    "report": ("Weekly report", True),
+}
+# Usually the room or the cable, not the drive itself
+LOW_METRICS = {"temp", "crc_errors"}
+
+
+def drive_topic(kind: str, level: str, metric: str = "") -> str:
+    if kind in ("resolved", "back"):
+        return "recovery"
+    if level == "crit":
+        return "drive_high"
+    return "drive_low" if metric in LOW_METRICS else "drive_middle"
+
+
+def topics_severity(topics: Sequence[str] | set[str] | None) -> str:
+    """The highest of low/middle/high among the topics, or "" if none has one."""
+    found = [t.rsplit("_", 1)[1] for t in topics or () if t.rsplit("_", 1)[-1] in SEVERITIES]
+    return max(found, key=SEVERITIES.index, default="")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -691,22 +747,25 @@ class Notifier:
     def configured(self) -> list[str]:
         return [name for name, on in self.channels().items() if on]
 
-    def send(self, event: dict, on_done: Callable[[list[str]], None] | None = None) -> None:
-        if not self.configured():
+    def send(self, event: dict, on_done: Callable[[list[str]], None] | None = None,
+             only: Sequence[str] | None = None) -> None:
+        """Sends to every configured channel, or only to those in `only`."""
+        targets = [c for c in self.configured() if only is None or c in only]
+        if not targets:
             if on_done:
                 on_done([])
             return
         try:
-            self._queue.put_nowait((event, on_done))
+            self._queue.put_nowait((event, on_done, targets))
         except queue.Full:
             log.error("Notification queue full, dropping a %s notification", event.get("kind"))
 
     def _run(self) -> None:
         while True:
-            event, on_done = self._queue.get()
+            event, on_done, targets = self._queue.get()
             sent = [name for name, fn in (("Discord", self._discord), ("mail", self._mail),
                                           ("webhook", self._webhook))
-                    if self.channels()[name] and self._retry(name, fn, event)]
+                    if name in targets and self._retry(name, fn, event)]
             if on_done:
                 try:
                     on_done(sent)
@@ -795,6 +854,296 @@ def _mail_html(event: dict) -> str:
 
 
 # ============================================================================
+# Missing updates. Host packages are checked against the OSV vulnerability database
+# (api.osv.dev, which carries the security trackers of Debian, Ubuntu and Alpine), drive
+# firmware against a list of known firmware bugs kept here. Both happen on the server, so
+# agents of every version profit from improvements. The agent's package list and the
+# answers from OSV are treated as hostile like everything else from outside.
+# ============================================================================
+
+SEVERITY_LEVEL = {"high": "crit", "middle": "warn", "low": "info"}  # colours and dots
+OSV_API = "https://api.osv.dev/v1"
+OSV_TIMEOUT = 30
+OSV_BATCH = 1000              # queries per querybatch request (the API's limit)
+OSV_WORKERS = 8               # parallel record fetches; a kernel package alone has ~9,000
+MAX_OSV_BYTES = 32 * 1024 * 1024
+MAX_VULNS = 50000             # per host and check
+MAX_PACKAGES = 20000
+UPDATE_CHECK_SECONDS = 12 * 3600
+UPDATE_RETRY_SECONDS = 3600
+PKG_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+._\-]{0,127}$")
+PKG_VERSION = re.compile(r"^[A-Za-z0-9.+~:_\-]{1,128}$")
+VULN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:_\-]{1,63}$")
+OS_KEY = re.compile(r"^[A-Z_]{1,32}$")
+# Advisories that bundle several CVEs. Each of those CVEs has its own record too, which
+# carries the rating, so the bundles are skipped instead of counted twice.
+GROUPED_ADVISORIES = ("DSA-", "DLA-", "DTSA-", "USN-")
+RATING_WORDS = {"negligible": "low", "unimportant": "low", "low": "low", "medium": "middle",
+                "moderate": "middle", "high": "high", "important": "high", "critical": "high"}
+
+# Known firmware bugs: model (regex, from the start), affected firmware (regex, whole),
+# the fixed version and how critical the update is. Sources: the vendors' notes.
+FIRMWARE_ADVISORIES: list[dict[str, str]] = [
+    {"model": r"Samsung SSD 980 PRO\b", "firmware": r"3B2QGXA7", "fixed": "5B2QGXA7",
+     "level": "high", "text": "Known firmware bug: the drive can suddenly become read-only. "
+     "Samsung fixed it in 5B2QGXA7 (Samsung Magician). Back up before updating."},
+    {"model": r"Samsung SSD 990 PRO\b", "firmware": r"0B2QJXD7", "fixed": "1B2QJXD7",
+     "level": "high", "text": "Known firmware bug: the drive's health value drops quickly. "
+     "Samsung fixed it in 1B2QJXD7 (Samsung Magician); health already lost does not return."},
+    {"model": r"INTEL SSDSC2K[BG]0(19|38)T8\b", "firmware": r"XCV10100", "fixed": "XCV10110",
+     "level": "high", "text": "Known firmware bug (D3-S4510/S4610, 1.92 and 3.84 TB): the drive "
+     "stops responding after about 1,700 idle power-on hours. Fixed in XCV10110."},
+]
+
+
+def firmware_issue(model: str, firmware: str) -> dict:
+    for adv in FIRMWARE_ADVISORIES:
+        if firmware and re.match(adv["model"], model, re.I) \
+                and re.fullmatch(adv["firmware"], firmware, re.I):
+            return {"level": adv["level"], "fixed": adv["fixed"], "text": adv["text"]}
+    return {}
+
+
+def osv_ecosystem(os_release: dict, package_type: str) -> str:
+    """The OSV ecosystem of a host, e.g. Debian:12, Ubuntu:24.04:LTS, Alpine:v3.20."""
+    os_id = os_release.get("ID", "").lower()
+    version = os_release.get("VERSION_ID", "")
+    if package_type == "dpkg" and os_id in ("debian", "raspbian") and re.fullmatch(r"\d{1,3}", version):
+        return f"Debian:{version}"
+    if package_type == "dpkg" and os_id == "ubuntu" and re.fullmatch(r"\d\d\.\d\d", version):
+        return f"Ubuntu:{version}:LTS" if "LTS" in os_release.get("VERSION", "") else f"Ubuntu:{version}"
+    m = re.fullmatch(r"(\d{1,2}\.\d{1,3})(\.\d+)?", version)
+    if package_type == "apk" and os_id == "alpine" and m:
+        return f"Alpine:v{m.group(1)}"
+    return ""
+
+
+def parse_host(raw: Any) -> dict | None:
+    """The host part of an agent report: OS and installed packages, checked and bounded."""
+    if not isinstance(raw, dict):
+        return None
+    os_raw = raw.get("os_release") if isinstance(raw.get("os_release"), dict) else {}
+    os_release = {k: clean_text(v) for k, v in list(os_raw.items())[:64]
+                  if isinstance(k, str) and OS_KEY.match(k)}
+    pk = raw.get("packages") if isinstance(raw.get("packages"), dict) else {}
+    package_type = pk.get("type") if pk.get("type") in ("dpkg", "apk") else ""
+    items = pk.get("list") if package_type and isinstance(pk.get("list"), list) else []
+    packages = []
+    for item in items[:MAX_PACKAGES]:
+        if not isinstance(item, list):
+            continue
+        f = [clean_text(x, 200) for x in item[:5]] + [""] * 5
+        if package_type == "dpkg":
+            name, version, source, arch, status = f[:5]
+            if not status.endswith(" installed"):  # removed, config files only, half-installed
+                continue
+            # "Source: glibc (2.36-9)" when the source version differs from the binary's
+            src, _, src_version = source.partition(" ")
+            src_version = src_version.strip("()")
+        else:
+            name, version, src, arch = f[:4]
+            src_version = ""
+        src, src_version = src or name, src_version or version
+        if all(PKG_NAME.match(n) for n in (name, src)) and all(
+                PKG_VERSION.match(v) for v in (version, src_version)):
+            packages.append({"name": name, "version": version, "source": src,
+                             "source_version": src_version, "arch": clean_text(arch, 32)})
+    packages.sort(key=lambda p: (p["name"], p["arch"]))
+    info = {
+        "name": os_release.get("PRETTY_NAME") or " ".join(
+            p for p in (os_release.get("NAME", ""), os_release.get("VERSION", "")) if p),
+        "id": os_release.get("ID", "").lower()[:32],
+        "version_id": os_release.get("VERSION_ID", "")[:32],
+        "kernel": clean_text(raw.get("kernel"), 64),
+        "package_type": package_type,
+        "ecosystem": osv_ecosystem(os_release, package_type),
+    }
+    return {"os": info, "packages": packages}
+
+
+def _dpkg_order(c: str) -> int:
+    if c.isdigit():
+        return 0
+    if c.isalpha():
+        return ord(c)
+    if c == "~":
+        return -1
+    return ord(c) + 256 if c else 0
+
+
+def _verrevcmp(a: str, b: str) -> int:
+    """dpkg's comparison of one version part (upstream version or revision)."""
+    i = j = 0
+    at = lambda s, k: s[k] if k < len(s) else ""  # noqa: E731
+    while i < len(a) or j < len(b):
+        while (at(a, i) and not at(a, i).isdigit()) or (at(b, j) and not at(b, j).isdigit()):
+            diff = _dpkg_order(at(a, i)) - _dpkg_order(at(b, j))
+            if diff:
+                return diff
+            i, j = i + 1, j + 1
+        while at(a, i) == "0":
+            i += 1
+        while at(b, j) == "0":
+            j += 1
+        first_diff = 0
+        while at(a, i).isdigit() and at(b, j).isdigit():
+            first_diff = first_diff or ord(a[i]) - ord(b[j])
+            i, j = i + 1, j + 1
+        if at(a, i).isdigit():
+            return 1
+        if at(b, j).isdigit():
+            return -1
+        if first_diff:
+            return first_diff
+    return 0
+
+
+def version_compare(a: str, b: str) -> int:
+    """Debian version order (epoch:upstream-revision); close enough for Alpine's versions to
+    pick the right fixed version."""
+    def split(v: str) -> tuple[int, str, str]:
+        epoch, sep, rest = v.partition(":")
+        if not sep or not epoch.isdigit():
+            epoch, rest = "0", v
+        upstream, _, revision = rest.rpartition("-") if "-" in rest else (rest, "", "")
+        return int(epoch[:9]), upstream, revision
+
+    ea, ua, ra = split(a)
+    eb, ub, rb = split(b)
+    if ea != eb:
+        return -1 if ea < eb else 1
+    return _verrevcmp(ua, ub) or _verrevcmp(ra, rb)
+
+
+_CVSS_AV = {"N": .85, "A": .62, "L": .55, "P": .2}
+_CVSS_AC = {"L": .77, "H": .44}
+_CVSS_UI = {"N": .85, "R": .62}
+_CVSS_CIA = {"H": .56, "L": .22, "N": 0}
+
+
+def cvss3_score(vector: str) -> float | None:
+    """The base score of a CVSS 3.x vector (FIRST's specification)."""
+    if not vector.startswith("CVSS:3"):
+        return None
+    m = dict(p.split(":", 1) for p in vector.split("/")[1:] if ":" in p)
+    try:
+        changed = m["S"] == "C"
+        pr = {"N": .85, "L": .68 if changed else .62, "H": .5 if changed else .27}[m["PR"]]
+        iss = 1 - (1 - _CVSS_CIA[m["C"]]) * (1 - _CVSS_CIA[m["I"]]) * (1 - _CVSS_CIA[m["A"]])
+        exploitability = 8.22 * _CVSS_AV[m["AV"]] * _CVSS_AC[m["AC"]] * pr * _CVSS_UI[m["UI"]]
+    except KeyError:
+        return None
+    impact = 7.52 * (iss - .029) - 3.25 * (iss - .02) ** 15 if changed else 6.42 * iss
+    if impact <= 0:
+        return 0.0
+    raw = min((1.08 if changed else 1) * (impact + exploitability), 10)
+    whole = round(raw * 100000)
+    return whole / 100000 if whole % 10000 == 0 else (whole // 10000 + 1) / 10
+
+
+def osv_severity(record: dict) -> tuple[str, str]:
+    """(low|middle|high, how it was rated). The distribution's own rating comes first, as it
+    knows how the package is built; then the CVSS score; unrated counts as middle."""
+    severity = record.get("severity") if isinstance(record.get("severity"), list) else []
+    for s in severity:
+        if isinstance(s, dict) and s.get("type") == "Ubuntu":
+            word = str(s.get("score", "")).lower()
+            if word in RATING_WORDS:
+                return RATING_WORDS[word], f"Ubuntu priority {word}"
+    for a in record.get("affected") if isinstance(record.get("affected"), list) else []:
+        urgency = _get(a, "ecosystem_specific", "urgency")
+        word = re.sub(r"[^a-z]", "", urgency.lower()) if isinstance(urgency, str) else ""
+        if word in RATING_WORDS:
+            return RATING_WORDS[word], f"Debian urgency {word}"
+    scores = [cvss3_score(s["score"]) for s in severity
+              if isinstance(s, dict) and s.get("type") == "CVSS_V3" and isinstance(s.get("score"), str)]
+    best = max((s for s in scores if s is not None), default=None)
+    if best is not None:
+        return ("high" if best >= 7 else "middle" if best >= 4 else "low"), f"CVSS {best:.1f}"
+    word = str(_get(record, "database_specific", "severity") or "").lower()
+    if word in RATING_WORDS:
+        return RATING_WORDS[word], f"rated {word}"
+    return "middle", "not rated yet"
+
+
+def reduce_vuln(record: Any) -> dict:
+    """The part of an OSV record that is needed: rating, CVEs and fixed versions."""
+    if not isinstance(record, dict):
+        raise ValueError("not a vulnerability record")
+    level, rating = osv_severity(record)
+    fixed: dict[str, list[str]] = {}
+    for a in record.get("affected") if isinstance(record.get("affected"), list) else []:
+        eco, name = clean_text(_get(a, "package", "ecosystem"), 64), clean_text(_get(a, "package", "name"))
+        if not eco.startswith(("Debian:", "Ubuntu:", "Alpine:")) or len(fixed) >= 1000:
+            continue
+        ranges = a.get("ranges") if isinstance(a.get("ranges"), list) else []
+        versions = [ev["fixed"] for r in ranges if isinstance(r, dict)
+                    for ev in (r.get("events") if isinstance(r.get("events"), list) else [])
+                    if isinstance(ev, dict) and isinstance(ev.get("fixed"), str)
+                    and PKG_VERSION.match(ev["fixed"])]
+        if versions:
+            fixed.setdefault(f"{eco}|{name}", []).extend(versions[:20])
+    refs = [r for key in ("upstream", "aliases") if isinstance(record.get(key), list)
+            for r in record[key]]
+    cves = sorted({r for r in refs if isinstance(r, str) and re.fullmatch(r"CVE-\d{4}-\d{1,8}", r)})[:5]
+    return {"level": level, "rating": rating, "cves": cves, "fixed": fixed,
+            "summary": clean_text(record.get("summary") or record.get("details"), 200)}
+
+
+def _osv(path: str, body: dict | None = None) -> Any:
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(f"{OSV_API}/{path}", data=data, method="POST" if data else "GET",
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": f"mimamori/{VERSION}"})
+    # A check makes thousands of requests: a single dropped or cut-off one is tried again
+    for attempt in range(3):
+        try:
+            with _opener.open(req, timeout=OSV_TIMEOUT) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                raw = resp.read(MAX_OSV_BYTES + 1)
+            if len(raw) > MAX_OSV_BYTES:
+                raise RuntimeError("answer too large")
+            return json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 and exc.code < 500 or attempt == 2:
+                raise
+        except (urllib.error.URLError, OSError, ValueError):
+            if attempt == 2:
+                raise
+        time.sleep(2 ** attempt * 2)
+    raise RuntimeError("unreachable")
+
+
+def osv_query(ecosystem: str, packages: Sequence[tuple[str, str]]) -> dict[tuple[str, str], dict[str, str]]:
+    """{(source package, version): {vulnerability id: modified}} of what affects them."""
+    out: dict[tuple[str, str], dict[str, str]] = {}
+    pending: list[tuple[tuple[str, str], str]] = [(p, "") for p in packages]
+    for _ in range(20):  # pages; a package rarely needs a second one
+        if not pending:
+            break
+        more = []
+        for start in range(0, len(pending), OSV_BATCH):
+            chunk = pending[start:start + OSV_BATCH]
+            queries = [{"package": {"name": name, "ecosystem": ecosystem}, "version": version,
+                        **({"page_token": token} if token else {})}
+                       for (name, version), token in chunk]
+            results = _osv("querybatch", {"queries": queries}).get("results")
+            if not isinstance(results, list) or len(results) != len(chunk):
+                raise RuntimeError("unexpected answer")
+            for (pkg, _), result in zip(chunk, results):
+                vulns = result.get("vulns") if isinstance(result, dict) else None
+                for v in vulns if isinstance(vulns, list) else []:
+                    if isinstance(v, dict) and isinstance(v.get("id"), str) and VULN_ID.match(v["id"]):
+                        out.setdefault(pkg, {})[v["id"]] = clean_text(v.get("modified"), 40)
+                token = result.get("next_page_token") if isinstance(result, dict) else None
+                if isinstance(token, str) and 0 < len(token) <= 1000:
+                    more.append((pkg, token))
+        pending = more
+    return out
+
+
+# ============================================================================
 # Monitor: ingest agent reports, keep drive status, raise alerts, and run the
 # periodic jobs (offline agents, retention, weekly report).
 # ============================================================================
@@ -809,6 +1158,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "report_time": "09:00",
     "report_last_sent": 0,  # last slot handled (sent or skipped)
     "report_delivered": 0,  # last time a report was actually sent
+    "notify_rules": {},  # channel -> topic -> bool; missing entries use NOTIFY_TOPICS
+    # Off until turned on: it sends package lists to an outside service (api.osv.dev)
+    "updates_check_enabled": False,
 }
 
 
@@ -868,6 +1220,22 @@ class Monitor:
         return merge_thresholds(self.setting("thresholds"),
                                 json.loads(drive["overrides"]) if drive else None)
 
+    def notify_rules(self) -> dict[str, dict[str, bool]]:
+        saved = self.setting("notify_rules")
+        saved = saved if isinstance(saved, dict) else {}
+        out = {}
+        for channel in CHANNELS:
+            mine = saved.get(channel) if isinstance(saved.get(channel), dict) else {}
+            out[channel] = {t: bool(mine.get(t, default)) for t, (_, default) in NOTIFY_TOPICS.items()}
+        return out
+
+    def channels_for(self, topics: set[str] | None) -> list[str] | None:
+        """The channels that want any of these topics; None (no topics) means all."""
+        if topics is None:
+            return None
+        rules = self.notify_rules()
+        return [c for c in CHANNELS if any(rules[c].get(t) for t in topics)]
+
     # agents ---------------------------------------------------------------
     def heartbeat(self, agent: dict, version: str, hostname: str) -> dict:
         self.db.execute("UPDATE agents SET last_seen = ?, agent_version = ?, hostname = ?, "
@@ -876,7 +1244,8 @@ class Monitor:
         if agent["offline_alerted"]:
             self.db.execute("UPDATE agents SET offline_alerted = 0 WHERE id = ?", (agent["id"],))
             self._alert(agent["id"], None, "agent_online", "ok",
-                        f"Agent {agent['name']} is back online", "Reports are coming in again.")
+                        f"Agent {agent['name']} is back online", "Reports are coming in again.",
+                        topics={"agent"})
         return {"scan_interval": int(self.setting("scan_interval_minutes")) * 60,
                 "heartbeat_interval": HEARTBEAT_SECONDS,
                 "scan_now": bool(agent["scan_requested"])}
@@ -893,6 +1262,7 @@ class Monitor:
         records = [rec for item in devices[:MAX_DEVICES] if isinstance(item, dict)
                    for rec in [parse_smart(item.get("smartctl"), clean_text(item.get("device")))]
                    if rec]
+        host = parse_host(payload.get("host"))  # agents from 0.2.2 on, when mounted
         now = int(time.time())
         pending_alerts: list[tuple] = []
         seen_ids: set[int] = set()
@@ -902,6 +1272,19 @@ class Monitor:
         with self.db.transaction() as conn:
             conn.execute("UPDATE agents SET last_report = ?, last_seen = ? WHERE id = ?",
                          (now, now, agent["id"]))
+            if host:
+                packages = json.dumps(host["packages"], separators=(",", ":"))
+                digest = hashlib.sha256((host["os"]["ecosystem"] + packages).encode()).hexdigest()
+                # A changed package list is checked again right away
+                conn.execute(
+                    """INSERT INTO hosts (agent_id, os_info, packages, packages_hash, reported)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT (agent_id) DO UPDATE SET
+                           os_info = excluded.os_info, packages = excluded.packages,
+                           packages_hash = excluded.packages_hash, reported = excluded.reported,
+                           checked = CASE WHEN hosts.packages_hash = excluded.packages_hash
+                                     THEN hosts.checked END""",
+                    (agent["id"], json.dumps(host["os"]), packages, digest, now))
             for rec in records:
                 if not rec["serial"]:
                     if rec["standby"] and rec["device"]:
@@ -922,6 +1305,15 @@ class Monitor:
                     (agent["id"], rec["serial"], rec["model"], rec["device"], rec["kind"],
                      rec["capacity"], rec["rpm"], rec["firmware"], now, now)).fetchone()
                 seen_ids.add(drive["id"])
+                fw = firmware_issue(rec["model"], rec["firmware"])
+                if fw != json.loads(drive["firmware_issue"]):
+                    conn.execute("UPDATE drives SET firmware_issue = ? WHERE id = ?",
+                                 (json.dumps(fw), drive["id"]))
+                    if fw:
+                        pending_alerts.append((
+                            drive, "firmware", SEVERITY_LEVEL[fw["level"]],
+                            f"{drive_name(dict(drive))}: firmware {rec['firmware']} should be "
+                            f"updated to {fw['fixed']}", fw["text"], {f"updates_{fw['level']}"}))
                 sample = {f: rec[f] for f in SAMPLE_FIELDS}
                 if sample["smart_passed"] is not None:
                     sample["smart_passed"] = int(sample["smart_passed"])
@@ -948,10 +1340,11 @@ class Monitor:
                              (json.dumps(issues), issues["missing"]["text"], drive["id"]))
                 pending_alerts.append((drive, "missing", "crit",
                                        f"{drive_name(dict(drive))} stopped responding",
-                                       "The drive was not in the last report from its agent."))
+                                       "The drive was not in the last report from its agent.",
+                                       {"drive_high"}))
 
-        for drive, kind, level, title, detail in pending_alerts:
-            self._alert(agent["id"], dict(drive), kind, level, title, detail)
+        for drive, kind, level, title, detail, topics in pending_alerts:
+            self._alert(agent["id"], dict(drive), kind, level, title, detail, topics=topics)
         return len(seen_ids)
 
     def _apply_issues(self, conn, drive, issues: dict) -> list[tuple]:
@@ -961,7 +1354,7 @@ class Monitor:
         if "missing" in old:
             old = {k: v for k, v in old.items() if k != "missing"}
             out.append((drive, "back", "ok", f"{name} is responding again",
-                        "The drive is back in its agent's report."))
+                        "The drive is back in its agent's report.", {"recovery"}))
         for t in transitions(old, issues):
             if t["kind"] == "worsened" and "from" in t:
                 metric = t["metric"].replace("_", " ")
@@ -970,13 +1363,16 @@ class Monitor:
                 title = f"{name}: resolved ({t['text']})"
             else:
                 title = f"{name}: {t['text']}"
-            out.append((drive, t["kind"], t["level"], title, _advice(t)))
+            out.append((drive, t["kind"], t["level"], title, _advice(t),
+                        {drive_topic(t["kind"], t["level"], t["metric"])}))
         conn.execute("UPDATE drives SET issues = ?, status = ?, summary = ? WHERE id = ?",
                      (json.dumps(issues), status_of(issues), summary_of(issues), drive["id"]))
         return out
 
     def _alert(self, agent_id: str, drive: dict | None, kind: str, level: str,
-               title: str, detail: str) -> None:
+               title: str, detail: str, topics: set[str] | None = None) -> None:
+        """Records an alert and sends it to the channels that want one of its `topics`
+        (see NOTIFY_TOPICS); without topics to every channel."""
         alert_id = self.db.execute(
             "INSERT INTO alerts (ts, agent_id, drive_id, kind, level, title, detail) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -984,6 +1380,9 @@ class Monitor:
              detail)).lastrowid
         if drive and drive.get("muted"):
             return
+        only = self.channels_for(topics)
+        if only is not None and not set(only) & set(self.notifier.configured()):
+            return  # recorded and shown, but no channel wants it
         # An agent on a compromised host must not be able to flood your channels: past the
         # limit, alerts are still recorded and shown, but not sent
         recent = self.db.one("SELECT COUNT(*) AS n FROM alerts WHERE agent_id = ? AND ts > ? "
@@ -1011,20 +1410,25 @@ class Monitor:
                 url = f"{self.cfg.public_url}/drive/{drive['id']}"
         serial = drive["serial"] if drive and not drive["serial"].startswith("no-serial:") else ""
         footer = " · ".join(p for p in ("mimamori", host, serial) if p)
+        severity = topics_severity(topics)
         label = {"crit": "Failing", "warn": "Watch", "ok": "OK"}.get(level, "Info")
         if kind == "missing":
             label = "Missing"
         elif kind == "agent_offline":
             label = "Offline"
+        elif kind in ("updates", "firmware"):
+            label = f"Update {severity}"
         ev = make_event(kind, level, f"{label} · {title}", detail, fields=fields, footer=footer,
-                        url=url, extra={"host": host, "drive": {k: drive[k] for k in (
-                            "device", "model", "serial")} if drive else None})
+                        url=url, extra={"host": host, "severity": severity,
+                                        "topics": sorted(topics or ()), "drive": {
+                                            k: drive[k] for k in ("device", "model", "serial")}
+                                        if drive else None})
 
         def done(channels: list[str]) -> None:
             self.db.execute("UPDATE alerts SET channels = ? WHERE id = ?",
                             (", ".join(channels), alert_id))
 
-        self.notifier.send(ev, done)
+        self.notifier.send(ev, done, only=only)
 
     # drives ---------------------------------------------------------------
     def reevaluate(self, drive_id: int) -> None:
@@ -1055,6 +1459,146 @@ class Monitor:
     # periodic jobs --------------------------------------------------------
     def start(self) -> None:
         threading.Thread(target=self._loop, name="scheduler", daemon=True).start()
+        # On its own thread: a check can take minutes and must not delay the offline alerts
+        threading.Thread(target=self._updates_loop, name="updates", daemon=True).start()
+
+    def _updates_loop(self) -> None:
+        while not self._stop.wait(60):
+            try:
+                self.check_due_updates()
+            except Exception:  # keep the thread alive
+                log.exception("Update check failed")
+
+    # missing updates ------------------------------------------------------
+    def check_due_updates(self) -> None:
+        if not self.setting("updates_check_enabled"):
+            return
+        for row in self.db.all("SELECT agent_id FROM hosts WHERE checked IS NULL OR checked < ?",
+                               (int(time.time()) - UPDATE_CHECK_SECONDS,)):
+            self.check_updates(row["agent_id"])
+
+    def _vuln_records(self, ids: dict[str, str]) -> dict[str, dict]:
+        """The reduced OSV records for these ids, fetched only when new or modified."""
+        cached: dict[str, sqlite3.Row] = {}
+        keys = list(ids)
+        for start in range(0, len(keys), 500):
+            chunk = keys[start:start + 500]
+            for r in self.db.all(f"SELECT * FROM vulns WHERE id IN ({','.join('?' * len(chunk))})",
+                                 tuple(chunk)):
+                cached[r["id"]] = r
+        out = {vid: json.loads(r["data"]) for vid, r in cached.items() if r["modified"] == ids[vid]}
+        stale = [vid for vid in keys if vid not in out]
+
+        def fetch(vid: str) -> dict | None:
+            try:
+                return reduce_vuln(_osv(f"vulns/{urllib.parse.quote(vid, safe='')}"))
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:  # withdrawn meanwhile
+                    return None
+                raise
+
+        pool = ThreadPoolExecutor(OSV_WORKERS)
+        try:
+            # Stored one by one, so an interrupted first check resumes where it stopped
+            for vid, rec in zip(stale, pool.map(fetch, stale)):
+                if rec is None:
+                    continue
+                out[vid] = rec
+                self.db.execute("INSERT INTO vulns (id, modified, data, fetched) VALUES (?, ?, ?, ?) "
+                                "ON CONFLICT (id) DO UPDATE SET modified = excluded.modified, "
+                                "data = excluded.data, fetched = excluded.fetched",
+                                (vid, ids[vid], json.dumps(rec), int(time.time())))
+        finally:
+            pool.shutdown(cancel_futures=True)  # after an error, do not fetch the rest
+        return out
+
+    def check_updates(self, agent_id: str) -> None:
+        """Compares a host's packages with OSV and stores what is missing; alerts on new finds."""
+        row = self.db.one("SELECT h.*, a.name FROM hosts h JOIN agents a ON a.id = h.agent_id "
+                          "WHERE h.agent_id = ?", (agent_id,))
+        if row is None:
+            return
+        now = int(time.time())
+        info, packages = json.loads(row["os_info"]), json.loads(row["packages"])
+        ecosystem = info.get("ecosystem", "")
+
+        def store(updates: list, unfixed: int, error: str, checked: int) -> bool:
+            # Only if the package list is still the one that was checked
+            return self.db.execute(
+                "UPDATE hosts SET updates = ?, unfixed = ?, error = ?, checked = ? "
+                "WHERE agent_id = ? AND packages_hash = ?",
+                (json.dumps(updates), unfixed, error, checked, agent_id,
+                 row["packages_hash"])).rowcount == 1
+
+        if not packages or not ecosystem:
+            store([], 0, "" if not packages else "The vulnerability database does not cover this "
+                  "system yet. Debian, Ubuntu and Alpine are supported.", now)
+            return
+        sources = sorted({(p["source"], p["source_version"]) for p in packages})
+        try:
+            found = osv_query(ecosystem, sources)
+            ids = {vid: mod for vulns in found.values() for vid, mod in vulns.items()
+                   if not vid.startswith(GROUPED_ADVISORIES)}
+            if len(ids) > MAX_VULNS:
+                raise RuntimeError("too many results")
+            records = self._vuln_records(ids)
+        except (urllib.error.URLError, OSError, RuntimeError, ValueError) as exc:
+            reason = str(getattr(exc, "reason", "") or getattr(exc, "code", "") or exc)[:120] \
+                or type(exc).__name__
+            log.warning("Update check for %s failed: %s", row["name"], reason)
+            store(json.loads(row["updates"]), row["unfixed"],
+                  f"The vulnerability database could not be reached ({reason}). "
+                  "The next try is in an hour.", now - UPDATE_CHECK_SECONDS + UPDATE_RETRY_SECONDS)
+            return
+
+        binaries: dict[tuple[str, str], list[str]] = defaultdict(list)
+        for p in packages:
+            binaries[(p["source"], p["source_version"])].append(p["name"])
+        order = cmp_to_key(version_compare)
+        updates, unfixed = [], 0
+        for (src, installed), vulns in found.items():
+            entry: dict[str, Any] | None = None
+            for vid in sorted(vulns):
+                rec = records.get(vid)
+                if rec is None:
+                    continue
+                fixes = [f for f in rec["fixed"].get(f"{ecosystem}|{src}", [])
+                         if version_compare(f, installed) > 0]
+                if not fixes:
+                    unfixed += 1  # known, but no update exists yet
+                    continue
+                fix = min(fixes, key=order)
+                if entry is None:
+                    entry = {"package": src, "installed": installed, "fixed": fix, "level": "low",
+                             "binaries": sorted(set(binaries[(src, installed)]))[:20], "vulns": []}
+                entry["fixed"] = max(entry["fixed"], fix, key=order)  # the one that fixes all
+                entry["level"] = max(entry["level"], rec["level"], key=SEVERITIES.index)
+                entry["vulns"].append({"id": vid, "cves": rec["cves"], "level": rec["level"],
+                                       "rating": rec["rating"], "summary": rec["summary"]})
+            if entry:
+                entry["vulns"].sort(key=lambda v: -SEVERITIES.index(v["level"]))
+                updates.append(entry)
+        updates.sort(key=lambda u: (-SEVERITIES.index(u["level"]), u["package"]))
+        if not store(updates, unfixed, "", now):
+            return  # a new package list came in meanwhile; it is checked next
+
+        known = {(u["package"], v["id"]) for u in json.loads(row["updates"]) for v in u["vulns"]}
+        new = [u for u in updates if any((u["package"], v["id"]) not in known for v in u["vulns"])]
+        if not new:
+            return
+        levels = {u["level"] for u in new}
+        top = max(levels, key=SEVERITIES.index)
+        n = len(new)
+        listed = ", ".join(f"{u['package']} {u['installed']} → {u['fixed']} ({u['level']})"
+                           for u in new[:15]) + (f" and {n - 15} more" if n > 15 else "")
+        self._alert(agent_id, None, "updates", SEVERITY_LEVEL[top],
+                    f"{row['name']}: {n} package{'s' if n != 1 else ''} with missing security "
+                    f"update{'s' if n != 1 else ''}",
+                    f"{listed}. Install the updates on the host (for example apt upgrade).",
+                    topics={f"updates_{lvl}" for lvl in levels})
+
+    def request_update_check(self, agent_id: str) -> None:
+        self.db.execute("UPDATE hosts SET checked = NULL WHERE agent_id = ?", (agent_id,))
 
     def _loop(self) -> None:
         last_retention = 0.0
@@ -1076,7 +1620,7 @@ class Monitor:
             self._alert(agent["id"], None, "agent_offline", "crit",
                         f"Agent {agent['name']} is offline",
                         f"No heartbeat since {self.clock(agent['last_seen'])}. "
-                        "Its drives are not being checked.")
+                        "Its drives are not being checked.", topics={"agent"})
 
     def retention(self) -> None:
         now = int(time.time())
@@ -1087,6 +1631,8 @@ class Monitor:
             # The full attribute tables are only needed for recent history
             conn.execute("UPDATE samples SET attrs = NULL WHERE ts < ? AND attrs IS NOT NULL",
                          (now - 35 * DAY,))
+            # Cached vulnerability records are fetched again when needed
+            conn.execute("DELETE FROM vulns WHERE fetched < ?", (now - 180 * DAY,))
 
     def next_report_time(self, after: dt.datetime | None = None) -> dt.datetime:
         now = after or dt.datetime.now(self.tz)
@@ -1114,7 +1660,12 @@ class Monitor:
     def send_report(self) -> None:
         self.db.set_setting("report_last_sent", int(time.time()))
         self.db.set_setting("report_delivered", int(time.time()))
-        self.notifier.send(report_event(build_report(self), self.cfg.public_url))
+        self.notifier.send(report_event(build_report(self), self.cfg.public_url),
+                           only=self.channels_for({"report"}))
+
+    def report_channels(self) -> list[str]:
+        """The configured channels that get the weekly report."""
+        return [c for c in self.notifier.configured() if c in self.channels_for({"report"})]
 
 
 # ============================================================================
@@ -1398,7 +1949,6 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
     # Changes with the user name or password, which signs out every older session
     session_epoch = hmac.new(secret_key, b"epoch\0" + cfg.admin_user.encode() + b"\0"
                              + cfg.admin_password.encode(), hashlib.sha256).hexdigest()[:16]
-    short_password = len(cfg.admin_password) < MIN_PASSWORD_LENGTH  # allowed, but not advised
     cfg.admin_password = ""  # only the hash stays in memory
     login_limiter = RateLimiter(MAX_TRIES, WINDOW)
     agent_limiter = RateLimiter(30, 300)
@@ -1463,10 +2013,6 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         if cfg.unsafe_hide_warnings:  # chosen by the admin: the log is the only warning left
             return []
         notes = []
-        if short_password and session.get("user"):
-            notes.append({"level": "soft", "text": f"The login password is shorter than "
-                          f"{MIN_PASSWORD_LENGTH} characters. Set a longer ADMIN_PASSWORD in "
-                          "secrets.env and recreate the container."})
         if cfg.unsafe_http and not request.is_secure:
             notes.append({"level": "strong", "text": "This connection is not encrypted. Your "
                           "password and all drive data travel in plain text and can be read by "
@@ -1665,13 +2211,25 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         for d in drives:
             d["latest"] = latest.get(d["id"], {})
             d["issues"] = json.loads(d["issues"])
+            d["fw"] = json.loads(d["firmware_issue"])
             d["spark"] = sparkline(history.get(d["id"], []))
             by_agent[d["agent_id"]].append(d)
+        hosts = {r["agent_id"]: r for r in db.all("SELECT agent_id, os_info, updates, checked "
+                                                  "FROM hosts")}
         for a in agents:
             a["online"] = agent_is_online(a)
             a["drives"] = sorted(by_agent.get(a["id"], []),
                                  key=lambda d: (STATUS_ORDER.get(d["status"], 9), d["device"]))
+            a.update(host_summary(hosts.get(a["id"]), a["drives"]))
         return agents, drives
+
+    def host_summary(host: sqlite3.Row | None, drives: list[dict]) -> dict:
+        updates = json.loads(host["updates"]) if host else []
+        return {"os": json.loads(host["os_info"]) if host else {},
+                "updates_checked": host["checked"] if host else None,
+                "update_counts": {s: sum(1 for u in updates if u["level"] == s) for s in SEVERITIES},
+                "update_total": len(updates),
+                "firmware_issues": sum(1 for d in drives if d.get("fw"))}
 
     def headline(agents: list[dict], drives: list[dict]) -> tuple[str, str]:
         if not drives:
@@ -1702,7 +2260,7 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             today=dt.datetime.now(tz),
             report_next=monitor.next_report_time() if monitor.setting("report_enabled") else None,
             report_last=int(monitor.setting("report_delivered")),
-            channels=monitor.notifier.configured())
+            channels=monitor.report_channels())
 
     def get_drive(drive_id: int) -> dict:
         row = db.one("SELECT d.*, a.name AS host, a.location FROM drives d JOIN agents a "
@@ -1711,10 +2269,37 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             abort(404)
         return dict(row)
 
+    @app.get("/host/<agent_id>")
+    def host(agent_id: str):
+        agent = get_agent(agent_id)
+        agent["online"] = agent_is_online(agent)
+        row = db.one("SELECT * FROM hosts WHERE agent_id = ?", (agent_id,))
+        drives = [dict(d) for d in db.all("SELECT * FROM drives WHERE agent_id = ? "
+                                          "ORDER BY device", (agent_id,))]
+        for d in drives:
+            d["fw"] = json.loads(d["firmware_issue"])
+        return render_template(
+            "host.html", a=agent, h=dict(row) if row else None, drives=drives,
+            summary=host_summary(row, drives),
+            updates=json.loads(row["updates"]) if row else [],
+            packages=json.loads(row["packages"]) if row else [],
+            check_enabled=monitor.setting("updates_check_enabled"),
+            next_check=(row["checked"] + UPDATE_CHECK_SECONDS) if row and row["checked"] else None)
+
+    @app.post("/host/<agent_id>/check-updates")
+    def host_check_updates(agent_id: str):
+        agent = get_agent(agent_id)
+        monitor.request_update_check(agent["id"])
+        flash("The packages are checked for missing updates within a minute or two."
+              if monitor.setting("updates_check_enabled") else
+              "The update check is turned off in Settings → Updates.")
+        return redirect(url_for("host", agent_id=agent["id"]))
+
     @app.get("/drive/<int:drive_id>")
     def drive(drive_id: int):
         d = get_drive(drive_id)
         d["issues"] = json.loads(d["issues"])
+        d["fw"] = json.loads(d["firmware_issue"])
         days = RANGES.get(request.args.get("range", "30"), 30)
         now = int(time.time())
         since = now - days * DAY
@@ -1861,14 +2446,16 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
     def report_page():
         return render_template(
             "report.html", r=build_report(monitor), enabled=monitor.setting("report_enabled"),
-            next_time=monitor.next_report_time(), channels=monitor.notifier.configured(),
+            next_time=monitor.next_report_time(), channels=monitor.report_channels(),
             last_sent=int(monitor.setting("report_delivered")))
 
     @app.post("/report/send")
     def report_send():
-        if monitor.notifier.configured():
+        if monitor.report_channels():
             monitor.send_report()
             flash("The weekly report is on its way.")
+        elif monitor.notifier.configured():
+            flash("No channel is set to get the weekly report (Settings → Notifications).", "error")
         else:
             flash("No notification channel is configured.", "error")
         return redirect(url_for("report_page"))
@@ -1906,7 +2493,22 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
                 "report_enabled", "report_weekday", "report_time")},
             thresholds=monitor.thresholds_for(None), kinds=KINDS, counters=COUNTERS,
             growth_choices=GROWTH_CHOICES, channels=monitor.notifier.channels(),
-            weekdays=WEEKDAYS, tz_name=str(tz))
+            weekdays=WEEKDAYS, tz_name=str(tz), rules=monitor.notify_rules(),
+            topics=NOTIFY_TOPICS, updates_enabled=monitor.setting("updates_check_enabled"))
+
+    @app.post("/settings/notifications")
+    def settings_notifications():
+        db.set_setting("notify_rules", {c: {t: bool(request.form.get(f"{c}:{t}"))
+                                            for t in NOTIFY_TOPICS} for c in CHANNELS})
+        flash("Notification choices saved.")
+        return redirect(url_for("settings") + "#notifications")
+
+    @app.post("/settings/updates")
+    def settings_updates():
+        db.set_setting("updates_check_enabled", bool(request.form.get("updates_check_enabled")))
+        flash("Update check turned on." if request.form.get("updates_check_enabled")
+              else "Update check turned off.")
+        return redirect(url_for("settings") + "#updates")
 
     @app.post("/settings/general")
     def settings_general():

@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge, severity %}
+{% block title %}{{ a.name }}{% endblock %}
+{% block content %}
+<a class="back" href="{{ url_for('overview') }}">← All drives</a>
+<div class="drive-head">
+  <div>
+    <h1>{{ a.name }}</h1>
+    <div class="quiet small">
+      {% if a.location %}{{ a.location }} · {% endif %}<span class="presence inline-presence"><span class="dot {{ 'on' if a.online else 'crit' }}"></span>{% if a.online %}agent online{% elif a.last_seen %}agent offline · last seen {{ a.last_seen|ago }}{% else %}waiting for the agent to connect{% endif %}</span>
+      {% if a.agent_version %} · agent {{ a.agent_version }}{% endif %}{% if a.hostname %} · {{ a.hostname }}{% endif %}
+    </div>
+  </div>
+  {% if h %}
+  <div class="actions">
+    <form class="inline" method="post" action="{{ url_for('host_check_updates', agent_id=a.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn" type="submit">Check updates now</button>
+    </form>
+  </div>
+  {% endif %}
+</div>
+
+<div class="tiles">
+  <div class="tile"><div class="label">System</div><div class="value small-value">{{ summary.os.name or '–' }}</div><div class="sub">{{ summary.os.ecosystem or 'not covered by the check' if h else 'not reported' }}</div></div>
+  <div class="tile"><div class="label">Kernel running</div><div class="value small-value mono">{{ summary.os.kernel or '–' }}</div><div class="sub">since the last reboot</div></div>
+  <div class="tile"><div class="label">Packages</div><div class="value">{{ packages|length if h else '–' }}</div><div class="sub">{% if h %}reported {{ h.reported|ago }}{% else %}not reported{% endif %}</div></div>
+  <div class="tile"><div class="label">Missing updates</div><div class="value {{ 'crit' if summary.update_counts.high else 'warn' if summary.update_counts.middle else 'ok' if h and h.checked else '' }}">{{ summary.update_total if h and h.checked else '–' }}</div><div class="sub">{% if summary.update_total %}{{ summary.update_counts.high }} high · {{ summary.update_counts.middle }} middle · {{ summary.update_counts.low }} low{% elif h and h.checked %}none known{% else %}not checked yet{% endif %}</div></div>
+  <div class="tile"><div class="label">Drive firmware</div><div class="value {{ 'warn' if summary.firmware_issues }}">{{ summary.firmware_issues }}</div><div class="sub">update{{ 's' if summary.firmware_issues != 1 }} recommended · {{ drives|length }} drive{{ 's' if drives|length != 1 }}</div></div>
+</div>
+
+<section class="section">
+  <h2>Missing security updates</h2>
+  <div class="panel">
+    {% if not h %}
+    <p class="empty">This agent does not report the host's packages. To see missing security updates, mount the host's package list read-only into the agent (see <span class="mono">volumes</span> in docker-compose.agent.yml), then recreate the agent container. This needs agent 0.2.2 or newer.</p>
+    {% else %}
+      {% if not check_enabled %}<div class="banner">The update check is off. Turn it on in <a href="{{ url_for('settings') }}#updates">Settings → Updates</a> to compare these packages with the OSV vulnerability database.</div>{% endif %}
+      {% if h.error %}<div class="banner flash error">{{ h.error }}</div>{% endif %}
+      {% if not h.checked %}
+      <p class="empty">Not checked yet{% if check_enabled %}; the first check runs within a few minutes and can take a while{% endif %}.</p>
+      {% elif not updates %}
+      <p class="empty">No missing security updates known for these packages. Checked {{ h.checked|ago }}{% if next_check %}, next check {{ next_check|time }}{% endif %}.</p>
+      {% else %}
+      <p class="quiet small">Packages with a known vulnerability that a newer version in the distribution fixes. Checked {{ h.checked|ago }} against the <a href="https://osv.dev" rel="noreferrer">OSV database</a>{% if next_check %}, next check {{ next_check|time }}{% endif %}.</p>
+      <div class="table-wrap">
+      <table>
+        <thead><tr><th>Severity</th><th>Package</th><th class="mono">Installed</th><th class="mono">Fixed in</th><th>Vulnerabilities</th></tr></thead>
+        <tbody>
+        {% for u in updates %}
+        <tr>
+          <td>{{ severity(u.level) }}</td>
+          <td>{{ u.package }}{% if u.binaries and u.binaries != [u.package] %}<div class="quiet small">{{ u.binaries|join(', ') }}</div>{% endif %}</td>
+          <td class="mono">{{ u.installed }}</td>
+          <td class="mono">{{ u.fixed }}</td>
+          <td>
+            <details class="vulns">
+              <summary>{{ u.vulns|length }} · {% for v in u.vulns[:3] %}{{ v.cves[0] if v.cves else v.id }}{{ ', ' if not loop.last }}{% endfor %}{% if u.vulns|length > 3 %} …{% endif %}</summary>
+              <ul>
+                {% for v in u.vulns %}
+                <li>{{ severity(v.level) }} <a href="https://osv.dev/vulnerability/{{ v.id }}" rel="noreferrer">{{ v.id }}</a> <span class="quiet small">· {{ v.rating }}{% if v.summary %} · {{ v.summary }}{% endif %}</span></li>
+                {% endfor %}
+              </ul>
+            </details>
+          </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+      {% endif %}
+      {% if h.checked and h.unfixed %}<p class="quiet small">Also {{ h.unfixed }} known vulnerabilit{{ 'ies' if h.unfixed != 1 else 'y' }} without a fixed version yet (the distribution has not released an update, or rates it as not worth one).</p>{% endif %}
+    {% endif %}
+  </div>
+</section>
+
+<section class="section">
+  <h2>Drive firmware</h2>
+  <div class="panel">
+    {% if drives %}
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Drive</th><th>Status</th><th class="mono">Firmware</th><th>Firmware update</th></tr></thead>
+      <tbody>
+      {% for d in drives %}
+      <tr>
+        <td><a href="{{ url_for('drive', drive_id=d.id) }}">{{ d.model or 'Unknown drive' }}</a> <span class="mono quiet">{{ d.device }}</span></td>
+        <td>{{ badge(d.status) }}</td>
+        <td class="mono">{{ d.firmware or '–' }}</td>
+        <td>{% if d.fw %}{{ severity(d.fw.level) }} to <span class="mono">{{ d.fw.fixed }}</span><div class="quiet small">{{ d.fw.text }}</div>{% else %}<span class="quiet">no known issue</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    <p class="quiet small">There is no public database of drive firmware versions. mimamori knows the firmware bugs listed in its source; for everything else, check the vendor's tool.</p>
+    {% else %}<p class="empty">No drives reported by this agent yet.</p>{% endif %}
+  </div>
+</section>
+
+{% if packages %}
+<section class="section">
+  <h2>Installed packages</h2>
+  <div class="panel">
+    <details>
+      <summary class="btn">Show all {{ packages|length }} packages</summary>
+      <div class="table-wrap">
+      <table>
+        <thead><tr><th>Package</th><th class="mono">Version</th><th>Architecture</th><th>Source</th></tr></thead>
+        <tbody>
+        {% for p in packages %}
+        <tr><td>{{ p.name }}</td><td class="mono">{{ p.version }}</td><td class="quiet">{{ p.arch }}</td><td class="quiet">{{ p.source if p.source != p.name }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </details>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

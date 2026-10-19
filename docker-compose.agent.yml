@@ -15,14 +15,25 @@ services:
       AGENT_NAME: docker-host     # CHANGE: name of this host, as the page shows it
       # DEVICES: /dev/sda,/dev/nvme0   # (optional) check only these; after a colon a smartctl -d type, e.g. /dev/sdb:sat
       # LOG_LEVEL: INFO           # (optional) DEBUG for more detail in the log
-    devices:                      # CHANGE: every drive to watch (list them with: ls /dev/sd? /dev/nvme?)
-      - /dev/sda
+    # CHANGE: every drive to watch (list them with: ls /dev/sd? /dev/nvme?), each written as
+    # /dev/sdX:/dev/sdX:r. The :r lets the container only read the drive, never write to it.
+    devices:
+      - /dev/sda:/dev/sda:r
+    # (optional) Missing security updates of this host: mount its OS and package list
+    # read-only, and the server checks them against the OSV vulnerability database.
+    # Debian, Ubuntu, Proxmox: remove the # in front of the first three lines.
+    # Alpine: remove it in front of the first two lines and the last one.
+    # volumes:
+    #   - /etc/os-release:/host/etc/os-release:ro
+    #   - /var/lib/dpkg:/host/var/lib/dpkg:ro
+    #   - /lib/apk/db:/host/lib/apk/db:ro
     tmpfs:
-      - /tmp:size=1m
+      - /tmp:size=1m,noexec,nosuid,nodev
     # Security hardening, leave as it is. Reading raw drives needs root inside the container,
     # so the agent splits itself at start: a small root part that only runs smartctl, and the
     # part that talks to the network, which becomes the user "nobody" without any capability.
-    # Every capability is dropped except SETUID/SETGID (for that split), SYS_RAWIO (SATA/SAS
+    # Every capability is dropped except SETUID/SETGID (for that split; the root part gives them
+    # up right after it), SYS_RAWIO (SATA/SAS
     # drives) and SYS_ADMIN (only for NVMe drives: remove that line if the host has none).
     read_only: true
     cap_drop:

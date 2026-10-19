@@ -135,6 +135,44 @@
       <button class="btn" type="submit">Send test notification</button>
     </form>
   </div>
+  <div class="panel">
+    <h2>What each channel gets</h2>
+    <p class="quiet small">Every alert is recorded and shown on this page; these choices only decide where it is sent. Muted drives are never sent. The test notification goes to every configured channel.</p>
+    <form method="post" action="{{ url_for('settings_notifications') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="table-wrap">
+      <table class="rules">
+        <thead><tr><th></th>{% for name, on in channels.items() %}<th class="center">{{ name }}{% if not on %}<div class="quiet small">not configured</div>{% endif %}</th>{% endfor %}</tr></thead>
+        <tbody>
+        {% for topic, info in topics.items() %}
+        {% set label = info[0] %}
+        <tr>
+          <td>{{ label }}</td>
+          {% for name in channels %}
+          <td class="center"><input type="checkbox" aria-label="{{ name }}: {{ label }}" name="{{ name }}:{{ topic }}" value="1" {{ 'checked' if rules[name][topic] }}></td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+      <p class="quiet small">Drive issues: <b>high</b> is Failing (a critical threshold, a failed SMART check) or a drive that stopped responding; <b>middle</b> is Watch for sectors, media errors and wear; <b>low</b> is Watch for temperature and cable CRC errors, which usually mean the room or the cable. Missing updates are rated by the distribution or by their CVSS score; drive firmware with a known bug counts as an update.</p>
+      <button class="btn primary" type="submit">Save</button>
+    </form>
+  </div>
+</section>
+
+<section class="section" id="updates">
+  <h2>Updates</h2>
+  <p>Agents whose host mounts its package list (see <span class="mono">volumes</span> in docker-compose.agent.yml) report the installed packages. mimamori checks them twice a day for missing security updates against the <a href="https://osv.dev" rel="noreferrer">OSV vulnerability database</a> (Debian, Ubuntu, Alpine). Drive firmware is compared with a list of known firmware bugs, without any outside connection.</p>
+  <div class="panel">
+    <form method="post" action="{{ url_for('settings_updates') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="field"><label class="check"><input type="checkbox" name="updates_check_enabled" value="1" {{ 'checked' if updates_enabled }}> Check host packages for missing security updates</label></div>
+      <p class="quiet small">This sends the names and versions of the installed packages and the system's release (for example Debian:12) to api.osv.dev, run by Google. No host names, addresses or drive data are sent. Off until you turn it on.</p>
+      <button class="btn primary" type="submit">Save</button>
+    </form>
+  </div>
 </section>
 
 <section class="section" id="report">

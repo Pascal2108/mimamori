@@ -32,11 +32,19 @@
     {% for a in agents %}
     <section class="host">
       <div class="host-head">
-        <h2>{{ a.name }}{% if a.location %} <span>· {{ a.location }}</span>{% endif %}</h2>
+        <h2><a class="host-link" href="{{ url_for('host', agent_id=a.id) }}">{{ a.name }}</a>{% if a.location %} <span>· {{ a.location }}</span>{% endif %}</h2>
         <span class="presence"><span class="dot {{ 'on' if a.online else 'crit' }}"></span>
           {% if a.online %}agent online · reported {{ a.last_report|ago }}{% elif a.last_seen %}agent offline · last seen {{ a.last_seen|ago }}{% else %}waiting for the agent to connect{% endif %}
         </span>
       </div>
+      {% if a.update_total or a.firmware_issues or a.os.name %}
+      <a class="host-updates" href="{{ url_for('host', agent_id=a.id) }}">
+        {% if a.os.name %}<span class="quiet">{{ a.os.name }}</span>{% endif %}
+        {% if a.update_total %}<span class="{{ 'crit' if a.update_counts.high else 'warn' if a.update_counts.middle else 'quiet' }}">{{ a.update_total }} package{{ 's' if a.update_total != 1 }} with missing security updates{% if a.update_counts.high %} · {{ a.update_counts.high }} high{% endif %}</span>
+        {% elif a.updates_checked %}<span class="ok">no missing updates known</span>{% endif %}
+        {% if a.firmware_issues %}<span class="warn">firmware update for {{ a.firmware_issues }} drive{{ 's' if a.firmware_issues != 1 }}</span>{% endif %}
+      </a>
+      {% endif %}
       {% if a.drives %}
       <div class="cards">
         {% for d in a.drives %}
@@ -70,6 +78,7 @@
           <div class="card-foot">
             {% if d.status == 'missing' %}Not responding to smartctl since {{ d.last_seen|time(false) }}
             {% elif d.summary %}Checked {{ s.ts|time(false) }} · {{ d.summary }}
+            {% elif d.fw %}Checked {{ s.ts|time(false) }} · <span class="warn">firmware update recommended</span>
             {% elif d.standby %}Asleep (standby) · not woken up for the check
             {% elif s.temp is none and s.power_on_hours is none %}Checked {{ s.ts|time(false) }} · no SMART data from this device
             {% else %}Checked {{ s.ts|time(false) }} · 14 days of temperature{% endif %}
@@ -87,7 +96,7 @@
     {# narrow screens: compact rows #}
     <div class="rows">
     {% for a in agents %}
-      <div class="host-caption">{{ a.name }}{% if a.location %} · {{ a.location }}{% endif %}{% if not a.online %} · offline{% endif %}</div>
+      <a class="host-caption" href="{{ url_for('host', agent_id=a.id) }}">{{ a.name }}{% if a.location %} · {{ a.location }}{% endif %}{% if not a.online %} · offline{% endif %}{% if a.update_total %} · <span class="{{ 'crit' if a.update_counts.high else 'warn' }}">{{ a.update_total }} update{{ 's' if a.update_total != 1 }} missing</span>{% endif %}{% if a.firmware_issues %} · <span class="warn">firmware</span>{% endif %}</a>
       {% for d in a.drives %}
       {% set s = d.latest %}
       <a class="drow {{ d.status }}" href="{{ url_for('drive', drive_id=d.id) }}">

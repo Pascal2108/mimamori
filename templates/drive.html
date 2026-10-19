@@ -31,6 +31,17 @@
 
 {% if d.muted %}<div class="banner">Alerts for this drive are muted: they are recorded, but no notifications are sent.</div>{% endif %}
 
+{% if d.fw %}
+{% set fw_cls = {'high': 'failing', 'middle': 'watch'}.get(d.fw.level, 'missing') %}
+<div class="callout {{ fw_cls }}">
+  <span class="dot {{ fw_cls }}"></span>
+  <div>
+    <strong>Firmware update recommended ({{ d.fw.level }}): {{ d.firmware }} → {{ d.fw.fixed }}</strong>
+    <p>{{ d.fw.text }}</p>
+  </div>
+</div>
+{% endif %}
+
 {% if d.issues %}
 {% set worst = (d.issues.values()|selectattr('level', 'equalto', 'crit')|list or d.issues.values()|list)[0] %}
 <div class="callout {{ d.status }}">

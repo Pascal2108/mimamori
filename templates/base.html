@@ -15,7 +15,7 @@
     </a>
     <nav class="nav" aria-label="Main">
       {% for endpoint, label in nav %}
-      <a href="{{ url_for(endpoint) }}" class="{{ 'active' if request.endpoint == endpoint or (endpoint == 'overview' and request.endpoint == 'drive') }}">{{ label }}</a>
+      <a href="{{ url_for(endpoint) }}" class="{{ 'active' if request.endpoint == endpoint or (endpoint == 'overview' and request.endpoint in ('drive', 'host')) }}">{{ label }}</a>
       {% endfor %}
     </nav>
     <div class="top-right">

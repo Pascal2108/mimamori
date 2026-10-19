@@ -260,6 +260,31 @@ details.confirm summary { cursor: pointer; list-style: none; display: inline-fle
 details.confirm summary::-webkit-details-marker { display: none; }
 details.confirm[open] .confirm-box { margin-top: 8px; }
 .agent-row td { vertical-align: top; }
+.rules td, .rules th { vertical-align: middle; }
+.center { text-align: center; }
+
+/* host page & updates ---------------------------------------------- */
+.host-link { color: var(--paper); }
+.host-updates {
+  display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12.5px; margin: -6px 0 12px;
+  color: var(--ash);
+}
+.host-updates:hover { text-decoration: none; }
+a.host-caption { display: block; }
+a.host-caption:hover { text-decoration: none; color: var(--paper); }
+.sev {
+  display: inline-block; border-radius: 999px; padding: 1px 9px; font-size: 11px;
+  letter-spacing: .06em; text-transform: uppercase; font-weight: 500;
+  background: #1c2a40; color: var(--ash);
+}
+.sev.high { background: #3a1f25; color: var(--hi); }
+.sev.middle { background: #33301c; color: var(--gold); }
+.tile .value.small-value { font-size: 16px; overflow-wrap: anywhere; }
+.inline-presence { display: inline-flex; }
+details.vulns summary { cursor: pointer; font-size: 13px; }
+details.vulns ul { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 6px; }
+details summary.btn { list-style: none; margin-bottom: 10px; }
+details summary.btn::-webkit-details-marker { display: none; }
 .agent-row form.row { margin-bottom: 6px; }
 
 /* login ------------------------------------------------------------ */

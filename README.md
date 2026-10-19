@@ -17,7 +17,8 @@ It runs as a server container behind your reverse proxy, plus a small agent cont
 - **One page for every host**: status, temperature, power-on hours, wear, reallocated, pending and uncorrectable sectors and CRC errors for each drive, grouped by host
 - **History** for every drive: temperature and sector counts over 7 days to a year, the full SMART attribute table with the change over the last week, and its alert log
 - **Thresholds you set**: defaults per drive type (hard drive, SATA SSD, NVMe), each overridable per drive; any reallocated, pending or uncorrectable sector marks a drive as *Watch*, a growing count as *Failing*, and a failed SMART self-assessment always counts as *Failing*
-- **Notifications** to Discord, mail and your own webhook (signed), when an issue appears, gets worse or is resolved, when a drive disappears and when an agent goes offline; drives can be muted
+- **Missing updates**: drive firmware with a known bug, and, if the host's package list is mounted into the agent, missing security updates of Debian, Ubuntu and Alpine hosts, checked against the [OSV vulnerability database](https://osv.dev) and rated low, middle or high; see [Missing updates](#missing-updates)
+- **Notifications** to Discord, mail and your own webhook (signed), when an issue appears, gets worse or is resolved, when a drive disappears, an agent goes offline or updates are missing; for each channel you choose what it gets (e.g. only high drive issues and high updates to Discord); drives can be muted
 - **Weekly report** with the state of every drive, by mail and Discord, on the day and time you choose
 - **Small agents**: their own image of about 27 MB using about 20 MB of memory. They only connect out, so no port opens on the monitored hosts. Sleeping drives are not woken up for a check
 - **Safe agent connection**: every message between agent and server is encrypted, signed in both directions and cannot be replayed; the server keeps only public keys; see [How agents connect](#how-agents-connect)
@@ -55,7 +56,7 @@ cp secrets.env.example secrets.env
 | Variable | Meaning |
 |---|---|
 | `ADMIN_USER` | User name for the page |
-| `ADMIN_PASSWORD` | Password for the page; choose a long one. Shorter than 12 characters works, but the log and the page advise against it |
+| `ADMIN_PASSWORD` | Password for the page; choose a long one. Shorter than 12 characters works, but the log advises against it at every start |
 | `DISCORD_WEBHOOK_URL` | Optional: a Discord channel webhook (Server Settings → Integrations → Webhooks) |
 | `SMTP_PASSWORD` | Optional: password of the mail account; the other mail settings are in `docker-compose.yml` |
 | `WEBHOOK_URL`, `WEBHOOK_SECRET` | Optional: your own webhook, see [Custom webhook](#custom-webhook) |
@@ -113,7 +114,7 @@ Repeat this for every host with drives to watch.
    AGENT_KEY=…
    ```
 
-4. In `docker-compose.agent.yml`, set `AGENT_NAME` and list every drive of the host under `devices` (`ls /dev/sd? /dev/nvme?` shows them). Both are marked `# CHANGE`. If the host has no NVMe drive, remove the line `- SYS_ADMIN`. Make `agent.env` readable only by root: `chmod 600 agent.env`.
+4. In `docker-compose.agent.yml`, set `AGENT_NAME` and list every drive of the host under `devices` (`ls /dev/sd? /dev/nvme?` shows them), each written as `/dev/sdb:/dev/sdb:r` so the container may only read it. Both are marked `# CHANGE`. If the host has no NVMe drive, remove the line `- SYS_ADMIN`. Make `agent.env` readable only by root: `chmod 600 agent.env`.
 5. Start the agent:
 
    ```bash
@@ -122,6 +123,8 @@ Repeat this for every host with drives to watch.
    ```
 
 The log shows `Reported … device(s)`, and the drives appear on the page within a minute. After that the agent checks every hour.
+
+**Missing security updates** (optional): to have the host's packages checked, remove the `#` in front of the `volumes:` lines for your system in `docker-compose.agent.yml` (Debian, Ubuntu and Proxmox: `os-release` and `dpkg`; Alpine: `os-release` and `apk`) and recreate the agent. Then turn the check on under **Settings → Updates** on the page. See [Missing updates](#missing-updates).
 
 **On the server's own host** the agent can skip the proxy: remove the `#` from the `networks:` lines at the end of `docker-compose.agent.yml` and set `SERVER_URL=http://mimamori:8000`. This is safe, because the messages are encrypted anyway.
 
@@ -143,10 +146,11 @@ The server's own key pair is created on its first start and kept in its data vol
 
 Reading SMART data needs raw access to the drives, which on Linux means root and the capability `SYS_RAWIO` (and `SYS_ADMIN` for NVMe drives). The agent keeps that power as small and as far from the network as it can:
 
-- **Privilege separation**, like OpenSSH: at start the agent splits into two processes. The **collector** keeps root, but only ever runs `smartctl` on the configured drives when asked; it has no network code and accepts a single request, "scan", without parameters. The **reporter** becomes the user `nobody` with **no capabilities at all**, and does everything else: the connection, the cryptography, reading the server's answers. A flaw in that network-facing code gives an attacker an unprivileged process with no access to the drives.
+- **Privilege separation**, like OpenSSH: at start the agent splits into two processes. The **collector** keeps root and the capabilities for the drives (it gives up `SETUID`/`SETGID` right after the split), but only ever runs `smartctl` on the configured drives when asked; it has no network code and accepts a single request, "scan", without parameters. The **reporter** becomes the user `nobody` with **no capabilities at all**, and does everything else: the connection, the cryptography, reading the server's answers. A flaw in that network-facing code gives an attacker an unprivileged process with no access to the drives.
 - **No open port**: the agent only connects out, to the one server whose key is in its `AGENT_KEY`. Nothing on the network can talk to it first.
 - **The server cannot command it**: the only things an answer can ask for are "check now" and the check interval. There is no way to run commands, change files or choose other devices from the server, even for someone who controls the server.
-- **Read-only**: smartctl only reads from the drives (`-a`), and sleeping drives are not woken up. The container's file system is read-only, and only the drives listed under `devices` exist in it.
+- **Host packages only when you mount them**: without the optional `volumes` lines, the agent sends nothing about the host. With them, the unprivileged reporter reads `/etc/os-release` and the package list (read-only mounts of world-readable files) and sends names and versions only.
+- **Read-only**: smartctl only reads from the drives (`-a`), and sleeping drives are not woken up. Only the drives listed under `devices` exist in the container, and only for reading (`:r`): even root inside it cannot open them for writing. The container's file system is read-only, and its small `/tmp` cannot hold programs (`noexec`).
 - **Contained**: every capability is dropped except `SETUID`/`SETGID` (needed once for the split), `SYS_RAWIO` and `SYS_ADMIN`; `no-new-privileges`, memory and process limits, Docker's default seccomp profile.
 
 What remains:
@@ -165,6 +169,18 @@ The server is separate from the agents in every respect: it holds no key that le
 - **Secrets** stay in `secrets.env` and in memory; the admin password is kept only as a hash. Logs never contain passwords, keys or webhook addresses.
 
 What remains: mimamori has one shared login without two-factor authentication and has not been audited, which is why it belongs into a private network, not on the internet.
+
+## Missing updates
+
+**Host packages.** An agent from 0.2.2 on reports the host's installed packages when its package list is mounted (see [step 6](#6-add-an-agent)). The server looks them up in the [OSV database](https://osv.dev), which carries the security trackers of Debian, Ubuntu and Alpine, twice a day and right after the list changes. A package counts as missing an update when a known vulnerability affects the installed version and the distribution has released a fixed version. Each one is rated by the distribution's own priority (Ubuntu priority, Debian urgency) or else by its CVSS score: **high** from 7.0, **middle** from 4.0, **low** below; unrated ones count as middle. The host's page (click its name on the overview) lists every package with the version that fixes it, the vulnerabilities, the running kernel and all installed packages. Vulnerabilities without a fixed version are only counted.
+
+The check sends the package names, versions and the release (e.g. `Debian:12`) to `api.osv.dev`, run by Google; no host names, addresses or drive data. That is why it is off until you turn it on under **Settings → Updates**. The server needs outbound HTTPS for it, like for Discord.
+
+After a release upgrade of the host (e.g. Debian 12 to 13), restart the agent or reboot the host, as you would after such an upgrade anyway: the agent sees the new `os-release` only from its next start, and until then the packages are checked against the old release.
+
+**Drive firmware.** Every report is compared with a list of firmware versions with known, serious bugs (e.g. the Samsung 980 PRO and 990 PRO health bugs, the Intel D3-S4510/S4610 1,700-hour bug), kept in `app.py`; this needs no outside connection and works with every agent. There is no public database of drive firmware, so a drive without a listed bug may still have a newer firmware: check the vendor's tool. New known bugs are welcome as issues.
+
+**Notifications.** A new finding raises one alert per host or drive, rated like above. Under **Settings → Notifications** you choose for each channel which alerts it gets: drive issues (high: Failing or missing; middle: Watch for sectors and wear; low: Watch for temperature and cable CRC errors), missing updates (high, middle, low; low is off by default), recoveries, agent offline and the weekly report.
 
 ## Using it
 
@@ -227,11 +243,12 @@ With `WEBHOOK_URL` set, mimamori sends every alert as a JSON `POST`:
  "title": "Failing · WDC WD40EFRX-68N32N0 · sdc: reallocated 264 → 312",
  "detail": "The drive is remapping or failing to read sectors. …",
  "fields": {"Host": "docker-host-2", "Device": "/dev/sdc", "Temperature": "47 °C"},
- "host": "docker-host-2", "drive": {"device": "/dev/sdc", "model": "…", "serial": "…"},
+ "host": "docker-host-2", "severity": "high", "topics": ["drive_high"],
+ "drive": {"device": "/dev/sdc", "model": "…", "serial": "…"},
  "url": "https://mimamori.example.com/drive/3", "ts": 1792270094}
 ```
 
-`kind` is one of `new_issue`, `worsened`, `resolved`, `missing`, `back`, `agent_offline`, `agent_online`, `report` and `test`; `level` is `crit`, `warn` or `ok`.
+`kind` is one of `new_issue`, `worsened`, `resolved`, `missing`, `back`, `agent_offline`, `agent_online`, `updates`, `firmware`, `report` and `test`; `level` is `crit`, `warn`, `info` or `ok`. Alerts also carry `severity` (`low`, `middle`, `high`, or empty) and `topics`, the rule names from Settings → Notifications (e.g. `["drive_high"]`, `["updates_middle"]`). Only alerts whose topic you allowed for the webhook are sent to it.
 
 With `WEBHOOK_SECRET` set, every request carries the headers `X-Mimamori-Timestamp` and `X-Mimamori-Signature: sha256=<hex>`, the HMAC-SHA256 of `<timestamp>.<raw body>` with the secret as key. Check the signature with a constant-time comparison and reject timestamps older than a few minutes.
 

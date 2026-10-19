@@ -1,4 +1,5 @@
-"""mimamori agent: reads the SMART data of this host's drives and reports it to the server.
+"""mimamori agent: reads the SMART data of this host's drives (and, if mounted, the host's
+installed packages) and reports it to the server.
 
     python agent.py          run the agent
     python agent.py health   container health check
@@ -329,11 +330,101 @@ def scan_devices() -> list[dict]:
 
 
 # ============================================================================
+# Installed packages of the host (optional)
+#
+# Only when the host's package database is mounted read-only under /host (see
+# docker-compose.agent.yml). The agent sends the raw fields; the server works out which
+# security updates are missing, so an older agent profits from a newer server here, too.
+# Without the mounts nothing about the host is sent.
+# ============================================================================
+
+HOST_ROOT = Path(os.environ.get("HOST_ROOT", "/host"))
+MAX_PACKAGES = 20000
+MAX_FIELD = 200
+DPKG_FIELDS = {"Package", "Status", "Version", "Source", "Architecture"}
+APK_FIELDS = {"P": "name", "V": "version", "o": "origin", "A": "arch"}
+
+
+def _read_os_release(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            key, sep, value = line.strip().partition("=")
+            if sep and re.match(r"^[A-Z_]{1,32}$", key) and len(out) < 64:
+                out[key] = value.strip().strip("\"'")[:MAX_FIELD]
+    return out
+
+
+def _read_dpkg(path: Path) -> list[list[str]]:
+    """[Package, Version, Source, Architecture, Status] per stanza of /var/lib/dpkg/status."""
+    out: list[list[str]] = []
+    entry: dict[str, str] = {}
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if not line.strip():
+                if entry.get("Package"):
+                    out.append([entry.get(k, "") for k in
+                                ("Package", "Version", "Source", "Architecture", "Status")])
+                    if len(out) >= MAX_PACKAGES:
+                        return out
+                entry = {}
+                continue
+            key, sep, value = line.partition(":")
+            if sep and not line[0].isspace() and key in DPKG_FIELDS:
+                entry[key] = value.strip()[:MAX_FIELD]
+    if entry.get("Package"):
+        out.append([entry.get(k, "") for k in
+                    ("Package", "Version", "Source", "Architecture", "Status")])
+    return out[:MAX_PACKAGES]
+
+
+def _read_apk(path: Path) -> list[list[str]]:
+    """[name, version, origin, arch] per package of /lib/apk/db/installed."""
+    out: list[list[str]] = []
+    entry: dict[str, str] = {}
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in [*f, "\n"]:
+            if not line.strip():
+                if entry.get("name"):
+                    out.append([entry.get(k, "") for k in ("name", "version", "origin", "arch")])
+                    if len(out) >= MAX_PACKAGES:
+                        break
+                entry = {}
+            elif line[1:2] == ":" and line[0] in APK_FIELDS:
+                entry[APK_FIELDS[line[0]]] = line[2:].strip()[:MAX_FIELD]
+    return out
+
+
+def read_host() -> dict | None:
+    """The host's OS and installed packages, or None when they are not mounted."""
+    sources = (("dpkg", HOST_ROOT / "var/lib/dpkg/status", _read_dpkg),
+               ("apk", HOST_ROOT / "lib/apk/db/installed", _read_apk))
+    host: dict[str, Any] = {}
+    try:
+        if (HOST_ROOT / "etc/os-release").is_file():
+            host["os_release"] = _read_os_release(HOST_ROOT / "etc/os-release")
+        for kind, path, reader in sources:
+            if path.is_file():
+                host["packages"] = {"type": kind, "list": reader(path)}
+                break
+    except OSError as exc:
+        log.warning("Cannot read the host's packages under %s: %s", HOST_ROOT,
+                    exc.strerror or type(exc).__name__)
+        return None
+    if not host:
+        return None
+    # The container shares the host's kernel: this is the kernel the host runs right now
+    host["kernel"] = os.uname().release if hasattr(os, "uname") else ""
+    return host
+
+
+# ============================================================================
 # Privilege separation
 #
 # Reading raw drives needs root and the capabilities SYS_RAWIO / SYS_ADMIN. Talking to the
 # network does not. So the agent splits itself in two at start, like OpenSSH:
-#   - the collector keeps root, but does nothing except run smartctl on the configured drives
+#   - the collector keeps root and the capabilities for the drives (SETUID/SETGID it drops
+#     right after the split), but does nothing except run smartctl on the configured drives
 #     when asked, and hand back the result. It never touches the network and accepts exactly
 #     one request, "scan", with no parameters.
 #   - the reporter drops to the user "nobody" with no capabilities at all, then does everything
@@ -383,14 +474,50 @@ def _collector(sock: socket.socket, child: int) -> int:
     return os.waitstatus_to_exitcode(status)
 
 
-def _can_change_user() -> bool:
-    """Whether this process holds CAP_SETUID (bit 7) and CAP_SETGID (bit 6)."""
+CAP_SETGID, CAP_SETUID = 6, 7
+
+
+def _status(field: str) -> int:
+    """A number from /proc/self/status, e.g. CapEff (hex) or NoNewPrivs; -1 if unknown."""
     try:
         with open("/proc/self/status") as f:
-            eff = int(re.search(r"^CapEff:\s*([0-9a-f]+)$", f.read(), re.M).group(1), 16)
+            value = re.search(rf"^{field}:\s*([0-9a-f]+)$", f.read(), re.M).group(1)
+        return int(value, 16 if field.startswith("Cap") else 10)
     except (OSError, AttributeError, ValueError):
-        return False
-    return bool(eff & (1 << 7)) and bool(eff & (1 << 6))
+        return -1
+
+
+def _can_change_user() -> bool:
+    """Whether this process holds CAP_SETUID and CAP_SETGID."""
+    eff = _status("CapEff")
+    return eff >= 0 and bool(eff & (1 << CAP_SETUID)) and bool(eff & (1 << CAP_SETGID))
+
+
+def _drop_capabilities(*caps: int) -> None:
+    """Removes these capabilities from this process for good. Lowering them needs no privilege;
+    with no-new-privileges, the programs it starts (smartctl) cannot get them back either."""
+    import ctypes
+
+    class Header(ctypes.Structure):
+        _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+    class Data(ctypes.Structure):
+        _fields_ = [("effective", ctypes.c_uint32), ("permitted", ctypes.c_uint32),
+                    ("inheritable", ctypes.c_uint32)]
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    header, data = Header(0x20080522, 0), (Data * 2)()  # _LINUX_CAPABILITY_VERSION_3
+    if libc.capget(ctypes.byref(header), data) != 0:
+        raise OSError(ctypes.get_errno(), "capget failed")
+    for cap in caps:
+        word, mask = cap // 32, ~(1 << cap % 32) & 0xFFFFFFFF
+        for field in ("effective", "permitted", "inheritable"):
+            setattr(data[word], field, getattr(data[word], field) & mask)
+    if libc.capset(ctypes.byref(header), data) != 0:
+        raise OSError(ctypes.get_errno(), "capset failed")
+    wanted = sum(1 << cap for cap in caps)
+    if any(_status(field) < 0 or _status(field) & wanted for field in ("CapEff", "CapPrm")):
+        raise OSError("the capabilities are still there")
 
 
 def _drop_privileges() -> None:
@@ -416,6 +543,18 @@ def _split() -> Callable[[], list[dict]]:
     pid = os.fork()
     if pid:  # collector
         child_sock.close()
+        # Changing users was only needed for the split: the collector gives that up at once
+        try:
+            _drop_capabilities(CAP_SETUID, CAP_SETGID)
+        except OSError as exc:
+            log.error("The collector cannot give up SETUID/SETGID (%s); stopping", exc)
+            os.kill(pid, signal.SIGTERM)
+            os.waitpid(pid, 0)
+            sys.exit(1)
+        if _status("NoNewPrivs") != 1:
+            log.warning("no-new-privileges is not set for this container: programs the agent "
+                        "starts as root could regain dropped capabilities. Keep security_opt "
+                        "from docker-compose.agent.yml")
         sys.exit(_collector(parent_sock, pid))
     parent_sock.close()
     _drop_privileges()
@@ -483,8 +622,12 @@ def run() -> int:
             beat = max(15, min(600, int(info.get("heartbeat_interval", beat))))
             if info.get("scan_now") or time.time() >= next_scan:
                 devices = scan()
-                result = client.post("report", {"version": VERSION, "hostname": name,
-                                                "devices": devices})
+                payload: dict[str, Any] = {"version": VERSION, "hostname": name,
+                                           "devices": devices}
+                host = read_host()  # in the unprivileged reporter: the files are world-readable
+                if host:
+                    payload["host"] = host
+                result = client.post("report", payload)
                 log.info("Reported %d device(s), the server tracks %s drive(s)", len(devices),
                          result.get("drives"))
                 next_scan = time.time() + interval

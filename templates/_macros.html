@@ -2,10 +2,14 @@
 <span class="badge {{ status }}"><span class="dot {{ status }}"></span>{{ status }}</span>
 {%- endmacro %}
 
+{% macro severity(level) -%}
+<span class="sev {{ level }}">{{ level }}</span>
+{%- endmacro %}
+
 {% macro alert_kind(a) -%}
 {%- set cls = {'crit': 'crit', 'warn': 'warn', 'ok': 'ok'}.get(a.level, 'quiet') -%}
 {%- if a.kind in ('missing', 'agent_offline') %}{% set cls = 'quiet' %}{% endif -%}
-<span class="alert-kind {{ cls }}">{{ {'new_issue': 'New issue', 'worsened': 'Worsened', 'resolved': 'Resolved', 'missing': 'Missing', 'back': 'Back', 'agent_offline': 'Agent offline', 'agent_online': 'Agent online'}.get(a.kind, a.kind) }}</span>
+<span class="alert-kind {{ cls }}">{{ {'new_issue': 'New issue', 'worsened': 'Worsened', 'resolved': 'Resolved', 'missing': 'Missing', 'back': 'Back', 'agent_offline': 'Agent offline', 'agent_online': 'Agent online', 'updates': 'Missing updates', 'firmware': 'Firmware'}.get(a.kind, a.kind) }}</span>
 {%- endmacro %}
 
 {% macro alert_dot(a) -%}

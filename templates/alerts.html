@@ -10,7 +10,7 @@
       {{ alert_dot(a) }}
       <div>
         {{ alert_kind(a) }}
-        <div class="alert-title">{% if a.drive_id %}<a href="{{ url_for('drive', drive_id=a.drive_id) }}">{{ a.title }}</a>{% else %}{{ a.title }}{% endif %}</div>
+        <div class="alert-title">{% if a.drive_id %}<a href="{{ url_for('drive', drive_id=a.drive_id) }}">{{ a.title }}</a>{% elif a.kind == 'updates' and a.agent_id %}<a href="{{ url_for('host', agent_id=a.agent_id) }}">{{ a.title }}</a>{% else %}{{ a.title }}{% endif %}</div>
         {% if a.detail %}<div class="quiet small">{{ a.detail }}</div>{% endif %}
         <div class="alert-meta">{% if a.host %}{{ a.host }} · {% endif %}{{ a.ts|time }} · {{ 'sent to ' ~ a.channels if a.channels else 'not sent' }}</div>
       </div>
