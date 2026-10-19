@@ -23,7 +23,7 @@
 
 <div class="tiles">
   <div class="tile"><div class="label">System</div><div class="value small-value">{{ summary.os.name or '–' }}</div><div class="sub">{{ summary.os.ecosystem or 'not covered by the check' if h else 'not reported' }}</div></div>
-  <div class="tile"><div class="label">Kernel running</div><div class="value small-value mono">{{ summary.os.kernel or '–' }}</div><div class="sub">since the last reboot</div></div>
+  <div class="tile"><div class="label">Kernel running</div><div class="value small-value mono">{{ summary.os.kernel or '–' }}</div><div class="sub">{% if summary.os.reboot %}<span class="warn">reboot needed: {{ summary.os.reboot }} is installed</span>{% else %}since the last reboot{% endif %}</div></div>
   <div class="tile"><div class="label">Packages</div><div class="value">{{ packages|length if h else '–' }}</div><div class="sub">{% if h %}reported {{ h.reported|ago }}{% else %}not reported{% endif %}</div></div>
   <div class="tile"><div class="label">Missing updates</div><div class="value {{ 'crit' if summary.update_counts.high else 'warn' if summary.update_counts.middle else 'ok' if h and h.checked else '' }}">{{ summary.update_total if h and h.checked else '–' }}</div><div class="sub">{% if summary.update_total %}{{ summary.update_counts.high }} high · {{ summary.update_counts.middle }} middle · {{ summary.update_counts.low }} low{% elif h and h.checked %}none known{% else %}not checked yet{% endif %}</div></div>
   <div class="tile"><div class="label">Drive firmware</div><div class="value {{ 'warn' if summary.firmware_issues }}">{{ summary.firmware_issues }}</div><div class="sub">update{{ 's' if summary.firmware_issues != 1 }} recommended · {{ drives|length }} drive{{ 's' if drives|length != 1 }}</div></div>

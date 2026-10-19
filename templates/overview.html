@@ -65,6 +65,7 @@
       {% if a.os.name or a.update_progress is not none or a.update_queued %}
       <a class="host-updates" href="{{ url_for('host', agent_id=a.id) }}">
         {% if a.os.name %}<span>{{ a.os.name }}</span>{% endif %}
+        {% if a.os.reboot %}<span class="warn">reboot needed for the installed kernel update</span>{% endif %}
         {% if a.update_progress is not none %}<span>checking for missing updates · {{ a.update_progress }} %</span>
         {% elif a.update_queued %}<span>update check starts within a minute</span>
         {% elif a.updates_checked and not a.update_total %}<span class="ok">no missing updates known</span>{% endif %}

@@ -1021,6 +1021,8 @@ def parse_host(raw: Any) -> dict | None:
         "id": os_release.get("ID", "").lower()[:32],
         "version_id": os_release.get("VERSION_ID", "")[:32],
         "kernel": clean_text(raw.get("kernel"), 64),
+        # A newer kernel is installed than the one running: the host needs a reboot
+        "reboot": kernel_reboot(packages, clean_text(raw.get("kernel"), 64)),
         "package_type": package_type,
         "ecosystem": osv_ecosystem(os_release, package_type),
     }
@@ -1130,6 +1132,37 @@ def osv_severity(record: dict) -> tuple[str, str]:
     if word in RATING_WORDS:
         return RATING_WORDS[word], f"rated {word}"
     return "middle", "not rated yet"
+
+
+# Kernel packages carry their version in the name (linux-image-6.8.0-31-generic,
+# linux-modules-…, linux-headers-…), so several of them stay installed side by side
+KERNEL_PACKAGE = re.compile(r"^linux-[a-z0-9-]*?\d+\.\d+")
+
+
+def current_packages(packages: list[dict]) -> list[dict]:
+    """The packages that count for missing updates. Of the kernels only the newest installed
+    version of each source package counts: the older ones are left over from earlier updates
+    (until "apt autoremove") and would otherwise show as missing an update forever."""
+    newest: dict[str, str] = {}
+    for p in packages:
+        if KERNEL_PACKAGE.match(p["name"]):
+            cur = newest.get(p["source"])
+            if cur is None or version_compare(p["source_version"], cur) > 0:
+                newest[p["source"]] = p["source_version"]
+    return [p for p in packages if not KERNEL_PACKAGE.match(p["name"])
+            or p["source_version"] == newest[p["source"]]]
+
+
+def kernel_reboot(packages: list[dict], running: str) -> str:
+    """The newer kernel version that is installed but not running yet, or ""."""
+    image = next((p for p in packages if p["name"] in (f"linux-image-{running}",
+                                                       f"linux-image-unsigned-{running}")), None)
+    if not running or image is None:
+        return ""
+    newest = max((p["source_version"] for p in packages
+                  if p["source"] == image["source"] and p["name"].startswith("linux-image-")),
+                 key=cmp_to_key(version_compare))
+    return newest if version_compare(newest, image["source_version"]) > 0 else ""
 
 
 def reduce_vuln(record: Any) -> dict:
@@ -1636,7 +1669,7 @@ class Monitor:
             store([], 0, "" if not packages else "The vulnerability database does not cover this "
                   "system yet. Debian, Ubuntu and Alpine are supported.", now)
             return
-        sources = sorted({(p["source"], p["source_version"]) for p in packages})
+        sources = sorted({(p["source"], p["source_version"]) for p in current_packages(packages)})
         try:
             # The query is quick (a few requests); fetching the records is the long part
             found = osv_query(ecosystem, sources, lambda done, total: self._set_progress(
@@ -2436,6 +2469,9 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             url = url_for("host", agent_id=a["id"])
             if a["last_seen"] and not a["online"]:
                 add("high", "agent", 1, a["name"], f"{a['name']} stopped reporting", url)
+            if a["os"].get("reboot"):  # a kernel update is installed, but not running yet
+                add("middle", "updates", 1, a["name"], f"{a['name']}: reboot to run the "
+                    f"installed kernel update ({a['os']['reboot']})", url)
             for level in reversed(SEVERITIES):
                 if n := a["update_counts"][level]:
                     add(level, "updates", n, a["name"], f"{a['name']}: {n} {SEVERITY_NAMES[level]} "
