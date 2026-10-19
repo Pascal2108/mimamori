@@ -20,7 +20,7 @@ It runs as a server container behind your reverse proxy, plus a small agent cont
 - **Missing updates**: drive firmware with a known bug, and, if the host's package list is mounted into the agent, missing security updates of Debian, Ubuntu and Alpine hosts, checked against the [OSV vulnerability database](https://osv.dev) and rated low, middle or high; see [Missing updates](#missing-updates)
 - **Notifications** to Discord, mail and your own webhook (signed), when an issue appears, gets worse or is resolved, when a drive disappears, an agent goes offline or updates are missing; for each channel you choose what it gets (e.g. only high drive issues and high updates to Discord); drives can be muted
 - **Weekly report** with the state of every drive, by mail and Discord, on the day and time you choose
-- **Small agents**: their own image of about 27 MB using about 20 MB of memory. They only connect out, so no port opens on the monitored hosts. Sleeping drives are not woken up for a check
+- **Small agents**: their own image of about 27 MB using about 30 MB of memory and next to no CPU. They only connect out, so no port opens on the monitored hosts. Sleeping drives are not woken up for a check
 - **Safe agent connection**: every message between agent and server is encrypted, signed in both directions and cannot be replayed; the server keeps only public keys; see [How agents connect](#how-agents-connect)
 - **Hardened containers**: the server runs as non-root, read-only, with all capabilities dropped. The agent splits itself in two: only a small part that runs smartctl keeps root, the part that talks to the network runs as `nobody` without any capability; see [Security of the agent](#security-of-the-agent)
 

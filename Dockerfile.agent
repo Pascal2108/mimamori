@@ -28,6 +28,9 @@ ENV APP_VERSION=$VERSION
 
 # Reading raw drives needs root inside the container. docker-compose.agent.yml drops every
 # capability except the two smartctl needs, and the container is read-only.
-HEALTHCHECK CMD python agent.py health || exit 1
+# Healthy while the last heartbeat the server answered is less than five minutes old (the same
+# as "python agent.py health"). Busybox instead of Python: Python would load the whole agent
+# with its cryptography every 30 seconds and use far more CPU than the agent itself.
+HEALTHCHECK CMD find /tmp/mimamori-agent-alive -mmin -5 | grep -q . || exit 1
 
 CMD ["python", "agent.py"]
