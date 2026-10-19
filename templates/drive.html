@@ -36,7 +36,7 @@
 <div class="callout {{ fw_cls }}">
   <span class="dot {{ fw_cls }}"></span>
   <div>
-    <strong>Firmware update recommended ({{ d.fw.level }}): {{ d.firmware }} → {{ d.fw.fixed }}</strong>
+    <strong>Firmware update recommended ({{ d.fw.level }}): {{ d.firmware }}{% if d.fw.fixed %} → {{ d.fw.fixed }}{% endif %}</strong>
     <p>{{ d.fw.text }}</p>
   </div>
 </div>
@@ -60,7 +60,11 @@
 {% endif %}
 
 <div class="tiles">
+  {% if d.temp_ignored %}
+  {{ tile('Temperature', 'off', 'ignored · reads ' ~ ('–' if latest.temp is none else latest.temp ~ ' °C')) }}
+  {% else %}
   {{ tile('Temperature', '–' if latest.temp is none else latest.temp ~ ' °C', 'limit ' ~ temp_limits.warn ~ ' °C' if temp_limits.warn is not none else 'no limit', lvl('temp')) }}
+  {% endif %}
   {{ tile('Power-on', latest.power_on_hours|num ~ ' h', '%.1f years'|format(latest.power_on_hours / 8766) if latest.power_on_hours else '') }}
   {% if d.kind == 'nvme' %}
   {{ tile('Wear', '–' if latest.wear is none else latest.wear ~ ' %', 'of rated endurance', lvl('wear')) }}
@@ -87,7 +91,7 @@
 
 <div class="charts">
   <div class="panel chart">
-    <div class="panel-head"><h2>Temperature</h2><span class="legend"><span><i></i>°C</span>{% if temp_limits.warn is not none %}<span><i class="dash"></i>warn {{ temp_limits.warn }}</span>{% endif %}</span></div>
+    <div class="panel-head"><h2>Temperature{% if d.temp_ignored %} <span class="quiet small">ignored, as read by the drive</span>{% endif %}</h2><span class="legend"><span><i></i>°C</span>{% if temp_limits.warn is not none and not d.temp_ignored %}<span><i class="dash"></i>warn {{ temp_limits.warn }}</span>{% endif %}</span></div>
     {{ chart(charts.temp, 'Temperature over time') }}
   </div>
   {% if d.kind == 'nvme' %}
@@ -166,13 +170,25 @@
       <h2>Thresholds</h2>
       <p class="quiet small">{% if overrides %}This drive overrides some global values.{% else %}Global defaults, no override for this drive.{% endif %}
         At or above <b>warn</b> the drive is Watch, at or above <b>crit</b> Failing. Growth compares with the value {{ growth_days }} day{{ 's' if growth_days != 1 }} ago.</p>
+      <form class="temp-switch" method="post" action="{{ url_for('drive_temperature', drive_id=d.id) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {% if d.temp_ignored %}
+        <p class="small"><b>Temperature is ignored.</b> The readings are kept, but they count neither towards the status nor alerts, the warmest drive or the reports.</p>
+        <button class="btn" type="submit">Check temperature again</button>
+        {% else %}
+        <p class="quiet small">If this drive reports temperatures that cannot be right (a faulty sensor or firmware), ignore them: they then count neither towards the status nor alerts, the warmest drive or the reports.</p>
+        <button class="btn" type="submit">Ignore temperature</button>
+        {% endif %}
+      </form>
       <form method="post" action="{{ url_for('drive_thresholds', drive_id=d.id) }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         {% set t = thresholds.temp.get(d.kind, thresholds.temp.unknown) %}
+        {% if not d.temp_ignored %}
         <div class="row">
           <div class="field"><label for="tw">Temp warn °C</label><input class="num" id="tw" name="temp_{{ d.kind }}_warn" type="number" min="0" max="120" value="{{ t.warn if t.warn is not none }}" placeholder="off"></div>
           <div class="field"><label for="tc">Temp crit °C</label><input class="num" id="tc" name="temp_{{ d.kind }}_crit" type="number" min="0" max="120" value="{{ t.crit if t.crit is not none }}" placeholder="off"></div>
         </div>
+        {% endif %}
         {% set metrics = ['media_errors', 'wear'] if d.kind == 'nvme' else ['reallocated', 'pending', 'uncorrectable', 'crc_errors'] + (['wear'] if d.kind == 'ssd' else []) %}
         {% for m in metrics %}
         {% set c = thresholds[m] %}

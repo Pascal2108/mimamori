@@ -174,6 +174,9 @@ a.card:hover { border-color: var(--line); text-decoration: none; }
 .badge.watch { background: #33301c; color: var(--gold); }
 .badge.failing { background: #3a1f25; color: var(--hi); }
 .badge .dot { width: 6px; height: 6px; }
+.badges { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.badge.fw-high { background: #3a1f25; color: var(--hi); }
+.badge.fw-middle { background: #33301c; color: var(--gold); }
 
 .panel {
   background: var(--slate); border: 1px solid var(--line-soft); border-radius: var(--radius);
@@ -181,6 +184,9 @@ a.card:hover { border-color: var(--line); text-decoration: none; }
 }
 .panel-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; gap: 12px; }
 .alert-list { list-style: none; margin: 0; padding: 0; }
+.temp-switch { padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--line-soft); }
+.temp-switch p { margin-top: 0; }
+.plain-list { margin: 0; padding-left: 18px; font-size: 13.5px; display: grid; gap: 6px; }
 .alert-list li { display: flex; gap: 10px; padding: 12px 0; border-top: 1px solid var(--line-soft); }
 .alert-list li:first-child { border-top: 0; padding-top: 4px; }
 .alert-list .dot { margin-top: 6px; }
@@ -270,6 +276,17 @@ details.confirm[open] .confirm-box { margin-top: 8px; }
   color: var(--ash);
 }
 .host-updates:hover { text-decoration: none; }
+.check-progress {
+  display: grid; gap: 8px; border-radius: var(--radius); padding: 12px 16px; margin-bottom: 16px;
+  font-size: 14px; border: 1px solid var(--line); background: var(--slate-2);
+}
+.check-progress progress {
+  width: 100%; height: 8px; appearance: none; border: 0; border-radius: 4px;
+  background: var(--line-soft); overflow: hidden; accent-color: var(--jade);
+}
+.check-progress progress::-webkit-progress-bar { background: var(--line-soft); }
+.check-progress progress::-webkit-progress-value { background: var(--jade); border-radius: 4px; }
+.check-progress progress::-moz-progress-bar { background: var(--jade); border-radius: 4px; }
 a.host-caption { display: block; }
 a.host-caption:hover { text-decoration: none; color: var(--paper); }
 .sev {
@@ -294,8 +311,12 @@ details summary.btn::-webkit-details-marker { display: none; }
 .pager { display: flex; justify-content: space-between; margin-top: 12px; }
 
 /* responsive ------------------------------------------------------- */
+@media (min-width: 1101px) {
+  .tiles.seven { grid-template-columns: repeat(7, minmax(0, 1fr)); }
+}
 @media (max-width: 1100px) {
   .tiles { grid-template-columns: repeat(3, 1fr); }
+  .tiles.seven { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .cards { grid-template-columns: repeat(2, 1fr); }
   .grid-main, .grid-detail { grid-template-columns: 1fr; }
 }
@@ -310,6 +331,9 @@ details summary.btn::-webkit-details-marker { display: none; }
   .tile .value { font-size: 20px; order: -1; margin: 0; }
   .tile .sub { display: none; }
   .tile.wide-only { display: none; }
+  .tiles.seven { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .tile.updates { grid-column: 1 / -1; flex-direction: row; align-items: baseline; gap: 8px; }
+  .tile.updates .sub { display: block; margin-left: auto; }
   .hosts-cards { display: none; }
   .rows { display: block; }
   .charts { grid-template-columns: 1fr; }

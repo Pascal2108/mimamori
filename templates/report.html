@@ -39,6 +39,14 @@
     </div>
   </div>
   <aside>
+    {% if r.updates %}
+    <div class="panel">
+      <h2>Missing updates</h2>
+      <ul class="plain-list">
+        {% for u in r.updates %}<li>{{ u }}</li>{% endfor %}
+      </ul>
+    </div>
+    {% endif %}
     <div class="panel">
       <h2>Delivery</h2>
       <p class="quiet small">

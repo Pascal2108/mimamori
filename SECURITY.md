@@ -63,3 +63,49 @@ from the network side, or to make an agent run anything but smartctl, is in scop
 
 mimamori is built for private networks: it has one shared login, no two-factor
 authentication, and it has not been audited.
+
+## How mimamori is secured
+
+### How agents connect
+
+An agent never opens a port; it connects to the server once a minute and sends its report when a check is due. The connection uses public-key cryptography, like SSH:
+
+- **Signed in both directions** (Ed25519). Each agent has its own key pair, and so does the server. The server accepts only messages signed with that agent's private key, and the agent accepts only answers signed by its server, for exactly the request it sent. Nobody can pose as an agent, pose as the server or slip in a fake "check now".
+- **Encrypted** (X25519 and AES-256-GCM) with a fresh one-time key for every message, so nobody in between can read a report. A key stolen later cannot decrypt recorded reports or answers either.
+- **Not replayable**: each message carries a time stamp that the server accepts only once and only in increasing order. A recorded message is rejected, and so is one from an agent whose clock is more than five minutes off.
+- **Only public keys on the server**: the agent's private key exists only in its `AGENT_KEY`, which the page shows once. The server stores just the public key, so even a full copy of the server's data cannot be used to send reports as one of your agents.
+- **One key per agent**: **New key** under Settings → Agents replaces it at once; the old key stops working.
+
+This holds over plain HTTP too, which is why an agent may use `http://` inside a Docker network. Over HTTPS through the proxy, TLS adds a second layer on top.
+
+"Check now" works the same way: the server never contacts an agent. It sets a flag, and the agent reads it from the answer to its next heartbeat, at most a minute later.
+
+The server's own key pair is created on its first start and kept in its data volume. If that volume is lost, every agent needs a new key.
+
+### Security of the agent
+
+Reading SMART data needs raw access to the drives, which on Linux means root and the capability `SYS_RAWIO` (and `SYS_ADMIN` for NVMe drives). The agent keeps that power as small and as far from the network as it can:
+
+- **Privilege separation**, like OpenSSH: at start the agent splits into two processes. The **collector** keeps root and the capabilities for the drives (it gives up `SETUID`/`SETGID` right after the split), but only ever runs `smartctl` on the configured drives when asked; it has no network code and accepts a single request, "scan", without parameters. The **reporter** becomes the user `nobody` with **no capabilities at all**, and does everything else: the connection, the cryptography, reading the server's answers. A flaw in that network-facing code gives an attacker an unprivileged process with no access to the drives.
+- **No open port**: the agent only connects out, to the one server whose key is in its `AGENT_KEY`. Nothing on the network can talk to it first.
+- **The server cannot command it**: the only things an answer can ask for are "check now" and the check interval. There is no way to run commands, change files or choose other devices from the server, even for someone who controls the server.
+- **Host packages only when you mount them**: without the optional `volumes` lines, the agent sends nothing about the host. With them, the unprivileged reporter reads `/etc/os-release` and the package list (read-only mounts of world-readable files) and sends names and versions only.
+- **Read-only**: smartctl only reads from the drives (`-a`), and sleeping drives are not woken up. Only the drives listed under `devices` exist in the container, and only for reading (`:r`): even root inside it cannot open them for writing. The container's file system is read-only, and its small `/tmp` cannot hold programs (`noexec`).
+- **Contained**: every capability is dropped except `SETUID`/`SETGID` (needed once for the split), `SYS_RAWIO` and `SYS_ADMIN`; `no-new-privileges`, memory and process limits, Docker's default seccomp profile.
+
+What remains:
+
+- The collector is root with access to the listed drives. A flaw in smartctl itself, triggered by a manipulated drive, would run with those rights. That needs physical access to the host or a malicious drive.
+- `SYS_ADMIN` is a broad capability. Leave it out if the host has no NVMe drive.
+- The agent's private key is in `agent.env` on the host. Whoever can read that file can send reports in the agent's name (not more: see above). Keep the file readable only by root (`chmod 600 agent.env`), and create a new key under Settings → Agents if it may have leaked.
+
+### Security of the server
+
+The server is separate from the agents in every respect: it holds no key that lets anyone act as an agent, and an agent can only ever affect its own drives.
+
+- **Hardened container**: non-root, read-only, every capability dropped, `no-new-privileges`, memory and process limits.
+- **The page**: one login with a lockout after five failed attempts per address, a session cookie that only travels over HTTPS (`__Host-`, `HttpOnly`, `SameSite=Strict`), a CSRF token on every form, a strict Content Security Policy without any JavaScript, and every value escaped. Without HTTPS the login does not work, unless you allow it with `UNSAFE_HTTP`.
+- **Agent messages are hostile input**: every message must carry a valid signature before it is even decrypted; every value from smartctl is type-checked, bounded and truncated. An agent can only change its own drives' data, may send at most one report every 20 seconds, and can trigger at most 20 notifications per hour; more alerts are recorded but not sent, so a compromised host cannot flood your Discord or mailbox.
+- **Secrets** stay in `secrets.env` and in memory; the admin password is kept only as a hash. Logs never contain passwords, keys or webhook addresses.
+
+What remains: mimamori has one shared login without two-factor authentication and has not been audited, which is why it belongs into a private network, not on the internet.

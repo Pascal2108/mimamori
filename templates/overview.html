@@ -5,12 +5,17 @@
 <p class="date">{{ today.strftime('%A') }}, {{ today.day }} {{ today.strftime('%B') }}</p>
 <h1 class="headline">{{ lead }}{% if attention %} <em>{{ attention }}</em>{% endif %}</h1>
 
-<div class="tiles">
+<div class="tiles seven">
   <div class="tile wide-only"><div class="label">Drives</div><div class="value">{{ drives|length }}</div><div class="sub">on {{ agents|length }} host{{ 's' if agents|length != 1 }}</div></div>
   <div class="tile"><div class="label">Healthy</div><div class="value ok">{{ counts.healthy }}</div><div class="sub">no open issues</div></div>
   <div class="tile"><div class="label">Watch</div><div class="value warn">{{ counts.watch }}</div><div class="sub">a warning threshold reached</div></div>
   <div class="tile"><div class="label">Failing</div><div class="value crit">{{ counts.failing }}</div><div class="sub">a critical threshold reached</div></div>
   <div class="tile"><div class="label">Missing</div><div class="value">{{ counts.missing }}</div><div class="sub">not responding</div></div>
+  {% set u = updates %}
+  <div class="tile updates"><div class="label">Updates</div>
+    <div class="value {{ 'crit' if u.high or u.firmware_high else 'warn' if u.packages or u.firmware else 'ok' }}">{{ u.packages + u.firmware }}</div>
+    <div class="sub">{% if u.packages or u.firmware %}{% if u.high %}{{ u.high }} high · {% endif %}{{ u.packages }} package{{ 's' if u.packages != 1 }} · {{ u.firmware }} firmware{% elif u.checked %}none known{% else %}none known · packages not checked{% endif %}</div>
+  </div>
   <div class="tile wide-only"><div class="label">Warmest</div>
     {% if warmest %}<div class="value">{{ warmest.latest.temp }} °C</div><div class="sub">{{ warmest.model }} · {{ warmest.device|replace('/dev/', '') }}</div>
     {% else %}<div class="value">–</div><div class="sub">no readings yet</div>{% endif %}
@@ -37,10 +42,12 @@
           {% if a.online %}agent online · reported {{ a.last_report|ago }}{% elif a.last_seen %}agent offline · last seen {{ a.last_seen|ago }}{% else %}waiting for the agent to connect{% endif %}
         </span>
       </div>
-      {% if a.update_total or a.firmware_issues or a.os.name %}
+      {% if a.update_total or a.firmware_issues or a.os.name or a.update_progress is not none %}
       <a class="host-updates" href="{{ url_for('host', agent_id=a.id) }}">
         {% if a.os.name %}<span class="quiet">{{ a.os.name }}</span>{% endif %}
-        {% if a.update_total %}<span class="{{ 'crit' if a.update_counts.high else 'warn' if a.update_counts.middle else 'quiet' }}">{{ a.update_total }} package{{ 's' if a.update_total != 1 }} with missing security updates{% if a.update_counts.high %} · {{ a.update_counts.high }} high{% endif %}</span>
+        {% if a.update_progress is not none %}<span class="quiet">checking for missing updates · {{ a.update_progress }} %</span>
+        {% elif a.update_queued %}<span class="quiet">update check starts within a minute</span>
+        {% elif a.update_total %}<span class="{{ 'crit' if a.update_counts.high else 'warn' if a.update_counts.middle else 'quiet' }}">{{ a.update_total }} package{{ 's' if a.update_total != 1 }} with missing security updates{% if a.update_counts.high %} · {{ a.update_counts.high }} high{% endif %}</span>
         {% elif a.updates_checked %}<span class="ok">no missing updates known</span>{% endif %}
         {% if a.firmware_issues %}<span class="warn">firmware update for {{ a.firmware_issues }} drive{{ 's' if a.firmware_issues != 1 }}</span>{% endif %}
       </a>
@@ -50,7 +57,7 @@
         {% for d in a.drives %}
         {% set s = d.latest %}
         <a class="card {{ d.status }}" href="{{ url_for('drive', drive_id=d.id) }}">
-          <div class="card-head">{{ badge(d.status) }}<span class="mono quiet">{{ d.device }}</span></div>
+          <div class="card-head"><span class="badges">{{ badge(d.status) }}{% if d.fw %}<span class="badge fw-{{ d.fw.level }}" title="{{ d.fw.text }}">firmware</span>{% endif %}</span><span class="mono quiet">{{ d.device }}</span></div>
           <h3 class="card-title">{{ d.model or 'Unknown drive' }}</h3>
           <div class="card-meta">{{ d.kind|kind }}{% if d.capacity %} · {{ d.capacity|bytes }}{% endif %} · <span class="mono">{{ d.serial|serial }}</span></div>
           <div class="metrics">
@@ -59,7 +66,8 @@
             <div><div class="k">Power on</div><div class="v">–</div></div>
             <div><div class="k">Last seen</div><div class="v">{{ d.last_seen|time(false) }}</div></div>
             {% else %}
-            <div><div class="k">Temp</div><div class="v {{ d.issues.temp.level if d.issues.temp }}">{{ '–' if s.temp is none else s.temp ~ ' °C' }}</div></div>
+            {% if d.temp_ignored %}<div><div class="k">Temp</div><div class="v quiet">off</div></div>
+            {% else %}<div><div class="k">Temp</div><div class="v {{ d.issues.temp.level if d.issues.temp }}">{{ '–' if s.temp is none else s.temp ~ ' °C' }}</div></div>{% endif %}
             <div><div class="k">Power on</div><div class="v">{{ s.power_on_hours|num }} h</div></div>
             {% if d.kind == 'hdd' or (s.wear is none and s.reallocated is not none) %}
               {% if s.pending and not s.reallocated %}
@@ -80,6 +88,7 @@
             {% elif d.summary %}Checked {{ s.ts|time(false) }} · {{ d.summary }}
             {% elif d.fw %}Checked {{ s.ts|time(false) }} · <span class="warn">firmware update recommended</span>
             {% elif d.standby %}Asleep (standby) · not woken up for the check
+            {% elif d.temp_ignored %}Checked {{ s.ts|time(false) }} · temperature ignored
             {% elif s.temp is none and s.power_on_hours is none %}Checked {{ s.ts|time(false) }} · no SMART data from this device
             {% else %}Checked {{ s.ts|time(false) }} · 14 days of temperature{% endif %}
           </div>
@@ -103,7 +112,7 @@
         <span class="dot {{ d.status }}"></span>
         <div>
           <div class="t">{{ d.model or 'Unknown drive' }} · {{ d.device|replace('/dev/', '') }}</div>
-          <div class="s">{% if d.status == 'missing' %}Missing since {{ d.last_seen|time(false) }}{% elif d.summary %}{{ d.status|capitalize }} · {{ d.summary }}{% elif s.wear is not none %}Healthy · {{ s.wear }} % worn{% else %}Healthy · {{ s.power_on_hours|num }} h{% endif %}</div>
+          <div class="s">{% if d.status == 'missing' %}Missing since {{ d.last_seen|time(false) }}{% elif d.summary %}{{ d.status|capitalize }} · {{ d.summary }}{% elif s.wear is not none %}Healthy · {{ s.wear }} % worn{% else %}Healthy · {{ s.power_on_hours|num }} h{% endif %}{% if d.fw %} · <span class="{{ 'crit' if d.fw.level == 'high' else 'warn' }}">firmware update</span>{% endif %}</div>
         </div>
         <span class="temp">{{ '–' if d.status == 'missing' or s.temp is none else s.temp ~ '°' }}</span>
       </a>

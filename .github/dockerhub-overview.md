@@ -64,7 +64,7 @@ networks:
     name: nginx_reverse_proxy
 ```
 
-This is the shortest working setup. The full [`docker-compose.yml`](https://github.com/Pascal2108/mimamori/blob/main/docker-compose.yml) on GitHub also lists optional settings that are not shown here, such as mail, the public address for links, history retention and running without a reverse proxy. They are explained under [Configuration](https://github.com/Pascal2108/mimamori#configuration) in the README.
+This is the shortest working setup. The full [`docker-compose.yml`](https://github.com/Pascal2108/mimamori/blob/main/docker-compose.yml) on GitHub also lists optional settings that are not shown here, such as mail, the public address for links, history retention and running without a reverse proxy. They are explained under [Configuration](https://github.com/Pascal2108/mimamori/blob/main/docs/configuration.md).
 
 Then `docker compose up -d`, add a proxy host for port `8000` of the container `mimamori`, sign in and add your hosts under **Settings → Agents**. The [setup guide](https://github.com/Pascal2108/mimamori#getting-started) explains every step.
 

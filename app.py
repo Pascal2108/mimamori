@@ -302,6 +302,10 @@ def parse_smart(raw: Any, device_hint: str = "") -> dict | None:
     for key in ("temp", "power_on_hours", "wear"):
         if out[key] is not None and out[key] < 0:
             out[key] = None
+    # Devices without a sensor (virtual disks, many USB bridges) report 0 °C; a running
+    # drive is never that cold
+    if out["temp"] == 0:
+        out["temp"] = None
     return out
 
 
@@ -427,8 +431,10 @@ def _max_level(a: str | None, b: str | None) -> str | None:
     return a if order[a] >= order[b] else b
 
 
-def find_issues(sample: dict, baseline: dict | None, kind: str, thresholds: dict) -> dict:
-    """Issues for the newest sample. Growth is measured against `baseline`."""
+def find_issues(sample: dict, baseline: dict | None, kind: str, thresholds: dict,
+                temp: bool = True) -> dict:
+    """Issues for the newest sample. Growth is measured against `baseline`.
+    temp=False leaves the temperature out (a drive whose sensor is marked as faulty)."""
     issues: dict[str, dict] = {}
     if sample.get("smart_passed") in (False, 0):
         issues["smart"] = {"level": "crit", "value": 0, "text": "SMART overall health check FAILED"}
@@ -436,7 +442,7 @@ def find_issues(sample: dict, baseline: dict | None, kind: str, thresholds: dict
     if cw:
         issues["critical_warning"] = {"level": "crit", "value": cw,
                                       "text": f"NVMe critical warning flags set ({cw})"}
-    temp = sample.get("temp")
+    temp = sample.get("temp") if temp else None
     t = thresholds["temp"].get(kind) or thresholds["temp"]["unknown"]
     level = _level(temp, t["warn"], t["crit"])
     if level:
@@ -584,6 +590,8 @@ CREATE TABLE IF NOT EXISTS vulns (
 # New columns go here instead of into SCHEMA, so databases of older versions get them too.
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("drives", "firmware_issue", "TEXT NOT NULL DEFAULT '{}'"),
+    # 1: the drive's temperature sensor is faulty; readings are kept but not evaluated or shown
+    ("drives", "temp_ignored", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -882,7 +890,10 @@ RATING_WORDS = {"negligible": "low", "unimportant": "low", "low": "low", "medium
                 "moderate": "middle", "high": "high", "important": "high", "critical": "high"}
 
 # Known firmware bugs: model (regex, from the start), affected firmware (regex, whole),
-# the fixed version and how critical the update is. Sources: the vendors' notes.
+# the fixed version ("" if there is no single one) and how critical the update is.
+# Sources: the vendors' notes, and the warnings in smartmontools' drive database (drivedb.h)
+# where they name the affected firmware. smartctl prints those warnings only as text, never in
+# its JSON, so the server keeps its own list.
 FIRMWARE_ADVISORIES: list[dict[str, str]] = [
     {"model": r"Samsung SSD 980 PRO\b", "firmware": r"3B2QGXA7", "fixed": "5B2QGXA7",
      "level": "high", "text": "Known firmware bug: the drive can suddenly become read-only. "
@@ -893,6 +904,37 @@ FIRMWARE_ADVISORIES: list[dict[str, str]] = [
     {"model": r"INTEL SSDSC2K[BG]0(19|38)T8\b", "firmware": r"XCV10100", "fixed": "XCV10110",
      "level": "high", "text": "Known firmware bug (D3-S4510/S4610, 1.92 and 3.84 TB): the drive "
      "stops responding after about 1,700 idle power-on hours. Fixed in XCV10110."},
+    # From smartmontools' drive database
+    {"model": r"(C400-MTFDDA[ACK](064|128|256|512)MAM|M4-CT(032|064|128|256|512)M4SSD[123])$",
+     "firmware": r"000[129]|0109", "fixed": "0309", "level": "high",
+     "text": "Known firmware bug (Crucial m4): the drive hangs after 5,184 power-on hours, and "
+     "every hour after that. Fixed in 0309."},
+    {"model": r"(MAXTOR )?STM3(500320|750330|1000340)AS?$", "firmware": r"MX15", "fixed": "MX1A",
+     "level": "high", "text": "Known firmware bug (Seagate DiamondMax 22): the drive can become "
+     "inaccessible after it is switched off and on. Fixed in MX1A."},
+    {"model": r"ST3(500[368]20|640[35]30|750[36]30|1000340)AS?$",
+     "firmware": r"AD14|SD1[5-9]|SD81", "fixed": "", "level": "high",
+     "text": "Known firmware bug (Seagate Barracuda 7200.11), depending on when the drive was "
+     "made: it can become inaccessible after it is switched off and on. Seagate's serial number "
+     "check on its support site tells whether this drive is affected and which firmware fixes it."},
+    {"model": r"ST9(2505610|3205620|5005620)AS$", "firmware": r"SD2[45]", "fixed": "SD28",
+     "level": "high", "text": "Known firmware bug (Seagate Momentus XT): the drive can corrupt "
+     "large files. Fixed in SD28."},
+    {"model": r"SAMSUNG HD(155|204)UI$", "firmware": r".*", "fixed": "", "level": "middle",
+     "text": "Known firmware bug (Samsung SpinPoint F4 EG): reading the drive's identity while it "
+     "writes, as smartctl and hdparm do, can lose data. The fixed firmware kept the same version "
+     "number, so mimamori cannot tell whether it is installed. If the patch from Seagate (which "
+     "took over Samsung's drives) was never applied, apply it, or remove the drive from the "
+     "agent until then."},
+    {"model": r"ST(1000|1500|2000|2500|3000)DM00[1-3]-9YN16.$", "firmware": r"CC4[679CG]",
+     "fixed": "", "level": "middle", "text": "Seagate has a newer firmware for this drive "
+     "(Barracuda 7200.14); its download finder lists it by model."},
+    {"model": r"ST3(25031|50032|75033|100034)0NS$", "firmware": r"MA07", "fixed": "",
+     "level": "middle", "text": "Known problems with this firmware (Seagate Barracuda ES.2, "
+     "Dell version). Dell support has the update."},
+    {"model": r"Corsair Force LS SSD$", "firmware": r"S9FM01\.8", "fixed": "", "level": "middle",
+     "text": "Corsair has a firmware update for this drive and strongly recommends it for some "
+     "serial numbers; see Corsair's support page for the Force LS."},
 ]
 
 
@@ -1115,11 +1157,13 @@ def _osv(path: str, body: dict | None = None) -> Any:
     raise RuntimeError("unreachable")
 
 
-def osv_query(ecosystem: str, packages: Sequence[tuple[str, str]]) -> dict[tuple[str, str], dict[str, str]]:
-    """{(source package, version): {vulnerability id: modified}} of what affects them."""
+def osv_query(ecosystem: str, packages: Sequence[tuple[str, str]],
+              progress: Callable[[int, int], None] | None = None) -> dict[tuple[str, str], dict[str, str]]:
+    """{(source package, version): {vulnerability id: modified}} of what affects them.
+    progress(done, total) is called after each batch of the first page."""
     out: dict[tuple[str, str], dict[str, str]] = {}
     pending: list[tuple[tuple[str, str], str]] = [(p, "") for p in packages]
-    for _ in range(20):  # pages; a package rarely needs a second one
+    for page in range(20):  # a package rarely needs a second page
         if not pending:
             break
         more = []
@@ -1139,6 +1183,8 @@ def osv_query(ecosystem: str, packages: Sequence[tuple[str, str]]) -> dict[tuple
                 token = result.get("next_page_token") if isinstance(result, dict) else None
                 if isinstance(token, str) and 0 < len(token) <= 1000:
                     more.append((pkg, token))
+            if progress and page == 0:
+                progress(start + len(chunk), len(pending))
         pending = more
     return out
 
@@ -1209,6 +1255,9 @@ class Monitor:
             log.warning("Unknown time zone %r, using UTC", cfg.timezone)
             self.tz = dt.timezone.utc
         self._stop = threading.Event()
+        # Agent id -> percent done of the update check running right now, for the page
+        self._progress: dict[str, int] = {}
+        self._progress_lock = threading.Lock()
 
     def clock(self, ts: int) -> str:
         return dt.datetime.fromtimestamp(ts, self.tz).strftime("%H:%M")
@@ -1313,7 +1362,8 @@ class Monitor:
                         pending_alerts.append((
                             drive, "firmware", SEVERITY_LEVEL[fw["level"]],
                             f"{drive_name(dict(drive))}: firmware {rec['firmware']} should be "
-                            f"updated to {fw['fixed']}", fw["text"], {f"updates_{fw['level']}"}))
+                            f"updated" + (f" to {fw['fixed']}" if fw["fixed"] else ""),
+                            fw["text"], {f"updates_{fw['level']}"}))
                 sample = {f: rec[f] for f in SAMPLE_FIELDS}
                 if sample["smart_passed"] is not None:
                     sample["smart_passed"] = int(sample["smart_passed"])
@@ -1324,7 +1374,8 @@ class Monitor:
                 baseline = _baseline(conn, drive["id"], sample_id, now - window)
                 issues = find_issues(sample, dict(baseline) if baseline else None, drive["kind"],
                                      merge_thresholds(global_thresholds,
-                                                      json.loads(drive["overrides"])))
+                                                      json.loads(drive["overrides"])),
+                                     temp=not drive["temp_ignored"])
                 pending_alerts += self._apply_issues(conn, drive, issues)
 
             # Drives this agent used to have but did not report: missing
@@ -1402,7 +1453,7 @@ class Monitor:
             latest = self.db.one("SELECT temp, power_on_hours FROM samples WHERE drive_id = ? "
                                  "ORDER BY ts DESC LIMIT 1", (drive["id"],))
             fields["Device"] = drive["device"]
-            if latest and latest["temp"] is not None:
+            if latest and latest["temp"] is not None and not drive.get("temp_ignored"):
                 fields["Temperature"] = f"{latest['temp']} °C"
             if latest and latest["power_on_hours"] is not None:
                 fields["Power-on"] = f"{latest['power_on_hours']:,} h"
@@ -1442,7 +1493,8 @@ class Monitor:
             window = int(self.setting("growth_window_days")) * DAY
             baseline = _baseline(conn, drive_id, latest["id"], latest["ts"] - window)
             issues = find_issues(dict(latest), dict(baseline) if baseline else None,
-                                 drive["kind"], self.thresholds_for(dict(drive)))
+                                 drive["kind"], self.thresholds_for(dict(drive)),
+                                 temp=not drive["temp_ignored"])
             old = json.loads(drive["issues"])
             if "missing" in old:
                 issues["missing"] = old["missing"]
@@ -1477,8 +1529,22 @@ class Monitor:
                                (int(time.time()) - UPDATE_CHECK_SECONDS,)):
             self.check_updates(row["agent_id"])
 
-    def _vuln_records(self, ids: dict[str, str]) -> dict[str, dict]:
-        """The reduced OSV records for these ids, fetched only when new or modified."""
+    def update_progress(self, agent_id: str) -> int | None:
+        """Percent done of this host's update check, or None when none is running."""
+        with self._progress_lock:
+            return self._progress.get(agent_id)
+
+    def _set_progress(self, agent_id: str, percent: int | None) -> None:
+        with self._progress_lock:
+            if percent is None:
+                self._progress.pop(agent_id, None)
+            else:  # 100 only once the result is stored
+                self._progress[agent_id] = max(0, min(99, percent))
+
+    def _vuln_records(self, ids: dict[str, str],
+                      progress: Callable[[int, int], None] | None = None) -> dict[str, dict]:
+        """The reduced OSV records for these ids, fetched only when new or modified.
+        progress(done, total) is called after each fetched record."""
         cached: dict[str, sqlite3.Row] = {}
         keys = list(ids)
         for start in range(0, len(keys), 500):
@@ -1500,7 +1566,9 @@ class Monitor:
         pool = ThreadPoolExecutor(OSV_WORKERS)
         try:
             # Stored one by one, so an interrupted first check resumes where it stopped
-            for vid, rec in zip(stale, pool.map(fetch, stale)):
+            for done, (vid, rec) in enumerate(zip(stale, pool.map(fetch, stale)), 1):
+                if progress:
+                    progress(done, len(stale))
                 if rec is None:
                     continue
                 out[vid] = rec
@@ -1514,6 +1582,13 @@ class Monitor:
 
     def check_updates(self, agent_id: str) -> None:
         """Compares a host's packages with OSV and stores what is missing; alerts on new finds."""
+        self._set_progress(agent_id, 0)
+        try:
+            self._check_updates(agent_id)
+        finally:
+            self._set_progress(agent_id, None)
+
+    def _check_updates(self, agent_id: str) -> None:
         row = self.db.one("SELECT h.*, a.name FROM hosts h JOIN agents a ON a.id = h.agent_id "
                           "WHERE h.agent_id = ?", (agent_id,))
         if row is None:
@@ -1536,12 +1611,15 @@ class Monitor:
             return
         sources = sorted({(p["source"], p["source_version"]) for p in packages})
         try:
-            found = osv_query(ecosystem, sources)
+            # The query is quick (a few requests); fetching the records is the long part
+            found = osv_query(ecosystem, sources, lambda done, total: self._set_progress(
+                agent_id, 10 * done // total))
             ids = {vid: mod for vulns in found.values() for vid, mod in vulns.items()
                    if not vid.startswith(GROUPED_ADVISORIES)}
             if len(ids) > MAX_VULNS:
                 raise RuntimeError("too many results")
-            records = self._vuln_records(ids)
+            records = self._vuln_records(ids, lambda done, total: self._set_progress(
+                agent_id, 10 + 89 * done // total))
         except (urllib.error.URLError, OSError, RuntimeError, ValueError) as exc:
             reason = str(getattr(exc, "reason", "") or getattr(exc, "code", "") or exc)[:120] \
                 or type(exc).__name__
@@ -1682,19 +1760,42 @@ def build_report(monitor: Monitor) -> dict:
         "(SELECT temp FROM samples s WHERE s.drive_id = d.id ORDER BY ts DESC LIMIT 1) AS temp, "
         "(SELECT MAX(temp) FROM samples s WHERE s.drive_id = d.id AND ts >= ?) AS max_temp "
         "FROM drives d JOIN agents a ON a.id = d.agent_id", (since,))]
+    for d in drives:
+        if d["temp_ignored"]:  # faulty sensor: its readings mean nothing
+            d["temp"] = d["max_temp"] = None
     drives.sort(key=lambda d: (STATUS_ORDER.get(d["status"], 9), d["host"], d["device"]))
     alerts = [dict(r) for r in monitor.db.all(
         "SELECT al.*, a.name AS host FROM alerts al LEFT JOIN agents a ON a.id = al.agent_id "
         "WHERE al.ts >= ? ORDER BY al.ts DESC", (since,))]
     attention = [d for d in drives if d["status"] != "healthy"]
+    # Missing updates: security updates per host, drive firmware with a known bug
+    updates, important = [], False
+    for h in monitor.db.all("SELECT a.name, h.updates FROM hosts h JOIN agents a "
+                            "ON a.id = h.agent_id ORDER BY a.name COLLATE NOCASE"):
+        found = json.loads(h["updates"])
+        high = sum(1 for u in found if u["level"] == "high")
+        important = important or bool(high)
+        if found:
+            updates.append(f"{h['name']}: {len(found)} package{'s' if len(found) != 1 else ''} "
+                           f"with missing security updates" + (f", {high} high" if high else ""))
+    for d in drives:
+        fw = json.loads(d["firmware_issue"])
+        if fw:
+            important = important or fw["level"] == "high"
+            updates.append(f"{d['model']} {d['device']} on {d['host']}: firmware update "
+                           f"recommended ({fw['level']})")
     if not drives:
         headline = "No drives reported yet."
-    elif not attention:
+    elif not attention and not important:
         headline = "The pond is calm. Every drive is healthy."
+    elif not attention:
+        headline = "Ripples on the pond: important updates are missing."
     else:
         n = len(attention)
-        headline = f"{n} drive{'s' if n != 1 else ''} need{'s' if n == 1 else ''} attention."
+        headline = f"{n} drive{'s' if n != 1 else ''} need{'s' if n == 1 else ''} attention." + (
+            " Important updates are missing." if important else "")
     return {
+        "updates": updates, "important_updates": important,
         "generated": int(time.time()), "since": since, "drives": drives, "alerts": alerts,
         "counts": {s: sum(1 for d in drives if d["status"] == s) for s in STATUS_ORDER},
         "warmest": max((d for d in drives if d["max_temp"] is not None),
@@ -1706,6 +1807,7 @@ def build_report(monitor: Monitor) -> dict:
 def report_event(data: dict, public_url: str) -> dict:
     lines = [f"{d['status'].upper()} · {d['model']} {d['device']} on {d['host']}: "
              f"{d['summary'] or 'see details'}" for d in data["attention"]]
+    lines += data["updates"]
     lines = lines or ["Nothing needs your attention."]
     lines.append(f"{len(data['alerts'])} alert(s) this week.")
     c = data["counts"]
@@ -1714,7 +1816,8 @@ def report_event(data: dict, public_url: str) -> dict:
     if data["warmest"]:
         w = data["warmest"]
         fields["Warmest this week"] = f"{w['max_temp']} °C · {w['model']} on {w['host']}"
-    level = "crit" if c["failing"] or c["missing"] else "warn" if c["watch"] else "ok"
+    level = "crit" if c["failing"] or c["missing"] else \
+        "warn" if c["watch"] or data["important_updates"] else "ok"
     ev = make_event("report", level, f"Weekly report · {data['headline']}", "\n".join(lines),
                     fields=fields, url=f"{public_url}/report" if public_url else "")
     ev["html"] = _report_html(data, level)
@@ -1735,12 +1838,16 @@ def _report_html(data: dict, level: str) -> str:
     alerts = "".join(f'<li style="color:#C9D2DE">{e(a["title"])}</li>'
                      for a in data["alerts"][:20]) or \
         '<li style="color:#98A6BA">No alerts this week.</li>'
+    updates = "".join(f'<li style="color:#C9D2DE">{e(u)}</li>' for u in data["updates"][:30])
+    updates = ('<h3 style="color:#EDF1F6;margin:20px 0 8px">Missing updates</h3>'
+               f'<ul style="padding-left:18px;font-size:14px">{updates}</ul>') if updates else ""
     return ('<div style="background:#0B1220;padding:24px;font-family:sans-serif">'
             f'<div style="background:#131F33;border-top:4px solid #{COLORS[level]:06X};'
             'border-radius:8px;padding:16px">'
             '<p style="color:#98A6BA;margin:0">mimamori · weekly report</p>'
             f'<h2 style="color:#EDF1F6;margin:4px 0 16px">{e(data["headline"])}</h2>'
             f'<table style="border-collapse:collapse;font-size:14px">{rows}</table>'
+            f'{updates}'
             '<h3 style="color:#EDF1F6;margin:20px 0 8px">Alerts this week</h3>'
             f'<ul style="padding-left:18px;font-size:14px">{alerts}</ul></div></div>')
 
@@ -2212,7 +2319,9 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             d["latest"] = latest.get(d["id"], {})
             d["issues"] = json.loads(d["issues"])
             d["fw"] = json.loads(d["firmware_issue"])
-            d["spark"] = sparkline(history.get(d["id"], []))
+            d["spark"] = "" if d["temp_ignored"] else sparkline(history.get(d["id"], []))
+            if d["temp_ignored"] and d["latest"]:  # faulty sensor: not shown, not "warmest"
+                d["latest"]["temp"] = None
             by_agent[d["agent_id"]].append(d)
         hosts = {r["agent_id"]: r for r in db.all("SELECT agent_id, os_info, updates, checked "
                                                   "FROM hosts")}
@@ -2225,34 +2334,69 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
 
     def host_summary(host: sqlite3.Row | None, drives: list[dict]) -> dict:
         updates = json.loads(host["updates"]) if host else []
+        progress = monitor.update_progress(host["agent_id"]) if host else None
         return {"os": json.loads(host["os_info"]) if host else {},
                 "updates_checked": host["checked"] if host else None,
+                "update_progress": progress,
+                # Due, but the check thread has not got to it yet (it looks once a minute)
+                "update_queued": bool(host and progress is None and host["checked"] is None
+                                      and monitor.setting("updates_check_enabled")),
                 "update_counts": {s: sum(1 for u in updates if u["level"] == s) for s in SEVERITIES},
                 "update_total": len(updates),
                 "firmware_issues": sum(1 for d in drives if d.get("fw"))}
 
     def headline(agents: list[dict], drives: list[dict]) -> tuple[str, str]:
-        if not drives:
+        def count(n: int) -> str:
+            return NUMBER_WORDS[n] if n < len(NUMBER_WORDS) else str(n)
+
+        # Important updates: security updates rated high, firmware with a serious known bug
+        update_hosts = [a for a in agents if a["update_counts"]["high"]]
+        firmware = [d for d in drives if d["fw"].get("level") == "high"]
+        if not drives and not update_hosts:
             return "The pond is still.", "No drives have reported yet."
         attention = [d for d in drives if d["status"] != "healthy"]
-        if not attention:
+        said = []
+        if attention:
+            n = len(attention)
+            hosts = {d["agent_id"] for d in attention}
+            where = ""
+            if len(hosts) == 1 and len(agents) > 1:
+                where = " on " + next(a["name"] for a in agents if a["id"] in hosts)
+            said.append(f"{count(n)} drive{'s' if n != 1 else ''}{where} need{'s' if n == 1 else ''} you.")
+        if len(update_hosts) == 1:
+            n = update_hosts[0]["update_counts"]["high"]
+            said.append(f"{update_hosts[0]['name']} is missing {'an' if n == 1 else count(n).lower()} "
+                        f"important security update{'s' if n != 1 else ''}.")
+        elif update_hosts:
+            said.append(f"{count(len(update_hosts))} hosts are missing important security updates.")
+        if firmware:
+            n = len(firmware)
+            said.append(f"{count(n)} drive{'s' if n != 1 else ''} need{'s' if n == 1 else ''} "
+                        "a firmware update.")
+        if not said:
             return "The pond is calm.", ""
-        n = len(attention)
-        count = NUMBER_WORDS[n] if n < len(NUMBER_WORDS) else str(n)
-        hosts = {d["agent_id"] for d in attention}
-        where = ""
-        if len(hosts) == 1 and len(agents) > 1:
-            where = " on " + next(a["name"] for a in agents if a["id"] in hosts)
-        lead = "The pond is mostly calm." if n < len(drives) else "The pond is restless."
-        return lead, f"{count} drive{'s' if n != 1 else ''}{where} need{'s' if n == 1 else ''} you."
+        if not attention:
+            lead = "Ripples on the pond."
+        elif len(attention) < len(drives) and not update_hosts and not firmware:
+            lead = "The pond is mostly calm."
+        else:
+            lead = "The pond is restless."
+        return lead, " ".join(said)
 
     @app.get("/")
     def overview():
         agents, drives = drive_cards()
         lead, attention = headline(agents, drives)
         warm = [d for d in drives if d["latest"].get("temp") is not None and d["status"] != "missing"]
+        updates = {"packages": sum(a["update_total"] for a in agents),
+                   "high": sum(a["update_counts"]["high"] for a in agents),
+                   "firmware": sum(1 for d in drives if d["fw"]),
+                   "firmware_high": sum(1 for d in drives if d["fw"].get("level") == "high"),
+                   "checked": any(a["updates_checked"] for a in agents)}
         return render_template(
             "overview.html", agents=agents, drives=drives, lead=lead, attention=attention,
+            updates=updates,
+            refresh=any(a["update_progress"] is not None or a["update_queued"] for a in agents),
             counts={s: sum(1 for d in drives if d["status"] == s) for s in STATUS_ORDER},
             warmest=max(warm, key=lambda d: d["latest"]["temp"], default=None),
             alerts=db.all("SELECT al.*, a.name AS host FROM alerts al LEFT JOIN agents a "
@@ -2280,7 +2424,8 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             d["fw"] = json.loads(d["firmware_issue"])
         return render_template(
             "host.html", a=agent, h=dict(row) if row else None, drives=drives,
-            summary=host_summary(row, drives),
+            summary=(summary := host_summary(row, drives)),
+            refresh=summary["update_progress"] is not None or summary["update_queued"],
             updates=json.loads(row["updates"]) if row else [],
             packages=json.loads(row["packages"]) if row else [],
             check_enabled=monitor.setting("updates_check_enabled"),
@@ -2396,6 +2541,9 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
     def drive_thresholds(drive_id: int):
         d = get_drive(drive_id)
         overrides = {} if request.form.get("reset") else threshold_form((d["kind"],))
+        old_temp = json.loads(d["overrides"]).get("temp")
+        if d["temp_ignored"] and old_temp and not request.form.get("reset"):
+            overrides["temp"] = old_temp  # its fields are hidden while ignored: keep it
         # Store only what differs from the global settings
         base = merge_thresholds(monitor.setting("thresholds"), None)
         if "temp" in overrides:
@@ -2414,6 +2562,17 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         db.execute("UPDATE drives SET overrides = ? WHERE id = ?", (json.dumps(overrides), drive_id))
         monitor.reevaluate(drive_id)
         flash("Thresholds saved." if overrides else "Using the global thresholds.")
+        return redirect(url_for("drive", drive_id=drive_id) + "#thresholds")
+
+    @app.post("/drive/<int:drive_id>/temperature")
+    def drive_temperature(drive_id: int):
+        d = get_drive(drive_id)
+        db.execute("UPDATE drives SET temp_ignored = ? WHERE id = ?",
+                   (0 if d["temp_ignored"] else 1, drive_id))
+        monitor.reevaluate(drive_id)
+        flash("Temperature is checked again." if d["temp_ignored"] else
+              "Temperature ignored: it no longer counts towards this drive's status, alerts "
+              "or reports.")
         return redirect(url_for("drive", drive_id=drive_id) + "#thresholds")
 
     @app.post("/drive/<int:drive_id>/mute")

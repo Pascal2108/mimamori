@@ -37,12 +37,22 @@
     {% else %}
       {% if not check_enabled %}<div class="banner">The update check is off. Turn it on in <a href="{{ url_for('settings') }}#updates">Settings → Updates</a> to compare these packages with the OSV vulnerability database.</div>{% endif %}
       {% if h.error %}<div class="banner flash error">{{ h.error }}</div>{% endif %}
-      {% if not h.checked %}
-      <p class="empty">Not checked yet{% if check_enabled %}; the first check runs within a few minutes and can take a while{% endif %}.</p>
+      {% if summary.update_progress is not none %}
+      <div class="check-progress">
+        <span>Checking the packages for missing updates · <strong>{{ summary.update_progress }} %</strong></span>
+        <progress max="100" value="{{ summary.update_progress }}">{{ summary.update_progress }} %</progress>
+        <span class="quiet small">The first check of a host takes a few minutes, later ones are quicker. This page updates itself.</span>
+      </div>
+      {% elif summary.update_queued %}
+      <div class="check-progress"><span>The check starts within a minute and can take a few minutes. This page updates itself.</span></div>
+      {% endif %}
+      {# A new check clears "checked"; the last result stays visible until it is replaced #}
+      {% if not h.checked and not updates %}
+      {% if summary.update_progress is none and not summary.update_queued %}<p class="empty">Not checked yet{% if check_enabled %}; the first check runs within a few minutes and can take a while{% endif %}.</p>{% endif %}
       {% elif not updates %}
       <p class="empty">No missing security updates known for these packages. Checked {{ h.checked|ago }}{% if next_check %}, next check {{ next_check|time }}{% endif %}.</p>
       {% else %}
-      <p class="quiet small">Packages with a known vulnerability that a newer version in the distribution fixes. Checked {{ h.checked|ago }} against the <a href="https://osv.dev" rel="noreferrer">OSV database</a>{% if next_check %}, next check {{ next_check|time }}{% endif %}.</p>
+      <p class="quiet small">Packages with a known vulnerability that a newer version in the distribution fixes. {% if h.checked %}Checked {{ h.checked|ago }}{% else %}Result of the last check{% endif %} against the <a href="https://osv.dev" rel="noreferrer">OSV database</a>{% if next_check %}, next check {{ next_check|time }}{% endif %}.</p>
       <div class="table-wrap">
       <table>
         <thead><tr><th>Severity</th><th>Package</th><th class="mono">Installed</th><th class="mono">Fixed in</th><th>Vulnerabilities</th></tr></thead>
@@ -87,7 +97,7 @@
         <td><a href="{{ url_for('drive', drive_id=d.id) }}">{{ d.model or 'Unknown drive' }}</a> <span class="mono quiet">{{ d.device }}</span></td>
         <td>{{ badge(d.status) }}</td>
         <td class="mono">{{ d.firmware or '–' }}</td>
-        <td>{% if d.fw %}{{ severity(d.fw.level) }} to <span class="mono">{{ d.fw.fixed }}</span><div class="quiet small">{{ d.fw.text }}</div>{% else %}<span class="quiet">no known issue</span>{% endif %}</td>
+        <td>{% if d.fw %}{{ severity(d.fw.level) }}{% if d.fw.fixed %} to <span class="mono">{{ d.fw.fixed }}</span>{% endif %}<div class="quiet small">{{ d.fw.text }}</div>{% else %}<span class="quiet">no known issue</span>{% endif %}</td>
       </tr>
       {% endfor %}
       </tbody>
