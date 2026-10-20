@@ -1570,6 +1570,7 @@ class Monitor:
 
     # periodic jobs --------------------------------------------------------
     def start(self) -> None:
+        self.recheck_after_server_update()
         threading.Thread(target=self._loop, name="scheduler", daemon=True).start()
         # On its own thread: a check can take minutes and must not delay the offline alerts
         threading.Thread(target=self._updates_loop, name="updates", daemon=True).start()
@@ -1582,6 +1583,17 @@ class Monitor:
                 log.exception("Update check failed")
 
     # missing updates ------------------------------------------------------
+    def recheck_after_server_update(self) -> None:
+        """A new server version may judge the same packages differently: check all hosts
+        again right away instead of showing the old result for up to UPDATE_CHECK_SECONDS."""
+        if self.db.get_setting("server_version") == VERSION:
+            return
+        with self.db.transaction() as conn:
+            conn.execute("UPDATE hosts SET checked = NULL")
+            conn.execute("INSERT INTO settings (key, value) VALUES ('server_version', ?) "
+                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                         (json.dumps(VERSION),))
+
     def check_due_updates(self) -> None:
         if not self.setting("updates_check_enabled"):
             return
