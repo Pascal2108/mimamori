@@ -59,7 +59,7 @@
       <div class="legend strip-legend"><span><i class="ok"></i>up</span><span><i class="part"></i>partly down</span><span><i class="fail"></i>down</span><span><i class="none"></i>no checks</span></div>
     </div>
     <div class="panel chart">
-      <div class="panel-head"><h2>Response time</h2><span class="legend"><span><i></i>ms</span>{% if stats.avg is not none %}<span>average {{ stats.avg }} ms · slowest {{ stats.max }} ms</span>{% endif %}</span></div>
+      <div class="panel-head"><h2>Response time</h2><span class="legend"><span><i></i>ms</span>{% if stats.avg is not none %}<span>{{ 'hourly average' if stats.hourly else 'average' }} {{ stats.avg }} ms · slowest {{ stats.max }} ms</span>{% endif %}</span></div>
       {{ chart(rt_chart, 'Response time over time') }}
     </div>
   </div>

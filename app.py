@@ -643,6 +643,17 @@ CREATE TABLE IF NOT EXISTS monitor_samples (
     ms INTEGER
 );
 CREATE INDEX IF NOT EXISTS monitor_samples_ts ON monitor_samples (monitor_id, ts);
+-- Added in 0.3.3: checks older than two days, summed up per hour (see rollup_monitor_samples)
+CREATE TABLE IF NOT EXISTS monitor_hours (
+    monitor_id INTEGER NOT NULL REFERENCES monitors(id) ON DELETE CASCADE,
+    hour INTEGER NOT NULL,                    -- start of the hour (unix time)
+    checks INTEGER NOT NULL,
+    ok INTEGER NOT NULL,                      -- of them up
+    ms_sum INTEGER NOT NULL DEFAULT 0,        -- response times of the checks that were up
+    ms_count INTEGER NOT NULL DEFAULT 0,
+    ms_max INTEGER,
+    PRIMARY KEY (monitor_id, hour)
+);
 """
 
 
@@ -1438,6 +1449,9 @@ MONITOR_INTERVALS = {30: "30 seconds", 60: "1 minute", 120: "2 minutes", 300: "5
 MAX_MONITORS = 100
 MONITOR_WORKERS = 8
 MONITOR_SAMPLE_DAYS = 90
+# Every single check is kept this long; older ones are summed up per hour, which keeps the
+# database small (one row per hour instead of up to 120) with the same uptime and charts
+MONITOR_RAW_HOURS = 48
 MAX_URL = 2048
 _LABEL = r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?"
 HOST_NAME = re.compile(rf"^(?=.{{1,253}}$){_LABEL}(?:\.{_LABEL})*\.?$")
@@ -1737,6 +1751,57 @@ def monitor_target(m: dict) -> str:
         return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
     host = f"[{m['target']}]" if ":" in m["target"] else m["target"]
     return f"{host}:{m['port']}" if m["kind"] == "tcp" else m["target"]
+
+
+def rollup_monitor_samples(conn: sqlite3.Connection, now: int) -> None:
+    """Sums up the checks older than MONITOR_RAW_HOURS per monitor and hour, and removes them.
+    Can run again and again: a later part of an hour is added to what is there."""
+    cutoff = (now - MONITOR_RAW_HOURS * 3600) // 3600 * 3600
+    conn.execute(
+        "INSERT INTO monitor_hours (monitor_id, hour, checks, ok, ms_sum, ms_count, ms_max) "
+        "SELECT monitor_id, ts / 3600 * 3600, COUNT(*), SUM(ok), COALESCE(SUM(ms), 0), "
+        "COUNT(ms), MAX(ms) FROM monitor_samples WHERE ts < ? "
+        "GROUP BY monitor_id, ts / 3600 * 3600 "
+        "ON CONFLICT (monitor_id, hour) DO UPDATE SET checks = checks + excluded.checks, "
+        "ok = ok + excluded.ok, ms_sum = ms_sum + excluded.ms_sum, "
+        "ms_count = ms_count + excluded.ms_count, "
+        "ms_max = MAX(COALESCE(ms_max, 0), COALESCE(excluded.ms_max, 0))", (cutoff,))
+    conn.execute("DELETE FROM monitor_samples WHERE ts < ?", (cutoff,))
+
+
+def monitor_uptime(db: "Database", since: int,
+                   monitor_id: int | None = None) -> dict[int, float]:
+    """monitor id -> share of its checks since `since` that were up (monitors without checks
+    are left out), from the single checks and the hourly sums."""
+    only = "AND monitor_id = ?" if monitor_id is not None else ""
+    args: tuple = (since, monitor_id) if monitor_id is not None else (since,)
+    rows = db.all(
+        "SELECT monitor_id, SUM(up) AS up, SUM(n) AS n FROM ("
+        "SELECT monitor_id, SUM(ok) AS up, COUNT(*) AS n FROM monitor_samples "
+        f"WHERE ts >= ? {only} GROUP BY monitor_id UNION ALL "
+        "SELECT monitor_id, SUM(ok), SUM(checks) FROM monitor_hours "
+        f"WHERE hour >= ? {only} GROUP BY monitor_id) GROUP BY monitor_id", args + args)
+    return {r["monitor_id"]: r["up"] / r["n"] for r in rows if r["n"]}
+
+
+def monitor_history(db: "Database", monitor_id: int, since: int,
+                    hourly: bool) -> list[dict]:
+    """The checks since `since`, each as {ts, checks, ok, ms_sum, ms_count, ms_max}: single
+    checks, or with `hourly` everything summed up per hour."""
+    if not hourly:
+        return [{"ts": r["ts"], "checks": 1, "ok": r["ok"], "ms_sum": r["ms"] or 0,
+                 "ms_count": 0 if r["ms"] is None else 1, "ms_max": r["ms"]}
+                for r in db.all("SELECT ts, ok, ms FROM monitor_samples WHERE monitor_id = ? "
+                                "AND ts >= ? ORDER BY ts", (monitor_id, since))]
+    return [dict(r) for r in db.all(
+        "SELECT hour AS ts, SUM(checks) AS checks, SUM(ok) AS ok, SUM(ms_sum) AS ms_sum, "
+        "SUM(ms_count) AS ms_count, MAX(ms_max) AS ms_max FROM ("
+        "SELECT ts / 3600 * 3600 AS hour, COUNT(*) AS checks, SUM(ok) AS ok, "
+        "COALESCE(SUM(ms), 0) AS ms_sum, COUNT(ms) AS ms_count, MAX(ms) AS ms_max "
+        "FROM monitor_samples WHERE monitor_id = ? AND ts >= ? GROUP BY 1 UNION ALL "
+        "SELECT hour, checks, ok, ms_sum, ms_count, ms_max FROM monitor_hours "
+        "WHERE monitor_id = ? AND hour >= ?) GROUP BY hour ORDER BY hour",
+        (monitor_id, since, monitor_id, since))]
 
 
 def human_duration(seconds: int) -> str:
@@ -2435,9 +2500,12 @@ class Monitor:
             conn.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
             conn.execute("DELETE FROM alerts WHERE ts < ?", (cutoff,))
             conn.execute("DELETE FROM fs_samples WHERE ts < ?", (cutoff,))
-            # One row per check adds up quickly: the status monitor keeps 90 days
-            conn.execute("DELETE FROM monitor_samples WHERE ts < ?",
-                         (max(cutoff, now - MONITOR_SAMPLE_DAYS * DAY),))
+            # One row per check adds up quickly: older checks are summed up per hour, and
+            # the status monitor keeps 90 days
+            rollup_monitor_samples(conn, now)
+            keep = max(cutoff, now - MONITOR_SAMPLE_DAYS * DAY)
+            conn.execute("DELETE FROM monitor_samples WHERE ts < ?", (keep,))
+            conn.execute("DELETE FROM monitor_hours WHERE hour < ?", (keep,))
             # The full attribute tables are only needed for recent history
             conn.execute("UPDATE samples SET attrs = NULL WHERE ts < ? AND attrs IS NOT NULL",
                          (now - 35 * DAY,))
@@ -2529,10 +2597,10 @@ def build_report(monitor: Monitor) -> dict:
                                f"used, {human_bytes(fs['free'])} free")
     monitors = []
     now = int(time.time())
-    for m in monitor.db.all(
-            "SELECT m.*, (SELECT AVG(ok) FROM monitor_samples s WHERE s.monitor_id = m.id "
-            "AND s.ts >= ?) AS uptime FROM monitors m WHERE paused = 0 "
-            "ORDER BY name COLLATE NOCASE", (since,)):
+    week = monitor_uptime(monitor.db, since)
+    for row in monitor.db.all("SELECT * FROM monitors WHERE paused = 0 "
+                              "ORDER BY name COLLATE NOCASE"):
+        m = dict(row, uptime=week.get(row["id"]))
         up = f" ({m['uptime'] * 100:.2f} % up this week)" if m["uptime"] is not None else ""
         if m["status"] == "down":
             levels.append("high")
@@ -3496,12 +3564,11 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
     def uptimes(days: Sequence[int], monitor_id: int | None = None) -> dict[int, dict]:
         """monitor id -> {days: share of checks that were up, or None without checks}"""
         now = int(time.time())
-        cols = ", ".join(f"AVG(CASE WHEN ts >= {now - d * DAY} THEN ok END) AS u{d}"
-                         for d in days)
-        rows = db.all(f"SELECT monitor_id, {cols} FROM monitor_samples WHERE ts >= ? "
-                      "AND (? IS NULL OR monitor_id = ?) GROUP BY monitor_id",
-                      (now - max(days) * DAY, monitor_id, monitor_id))
-        return {r["monitor_id"]: {d: r[f"u{d}"] for d in days} for r in rows}
+        out: dict[int, dict] = defaultdict(dict)
+        for d in days:
+            for mid, share in monitor_uptime(db, now - d * DAY, monitor_id).items():
+                out[mid][d] = share
+        return out
 
     def beats(samples: Sequence[sqlite3.Row]) -> list[dict]:
         """The last checks as small bars, the newest on the right."""
@@ -3511,14 +3578,15 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
                  "title": f"{fmt_time(s['ts'])}: " + (f"up, {s['ms']} ms" if s["ok"] else "down")}
                 for i, s in enumerate(last)]
 
-    def availability(samples: Sequence[sqlite3.Row], t0: int, t1: int,
+    def availability(history: Sequence[dict], t0: int, t1: int,
                      buckets: int = 90) -> list[dict]:
         """The range in `buckets` slices: all up, partly down, down, or no checks."""
         counts = [[0, 0] for _ in range(buckets)]
         span = max(t1 - t0, 1)
-        for s in samples:
-            i = min(buckets - 1, max(0, (s["ts"] - t0) * buckets // span))
-            counts[i][0 if s["ok"] else 1] += 1
+        for h in history:
+            i = min(buckets - 1, max(0, (h["ts"] - t0) * buckets // span))
+            counts[i][0] += h["ok"]
+            counts[i][1] += h["checks"] - h["ok"]
         out = []
         for i, (up, down) in enumerate(counts):
             cls = "none" if not up and not down else "fail" if not up else "part" if down else "ok"
@@ -3550,19 +3618,25 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         m = monitor_view(get_monitor(monitor_id), now)
         days = status_ranges.get(request.args.get("range", "1"), 1)
         since = now - days * DAY
-        samples = db.all("SELECT ts, ok, ms FROM monitor_samples WHERE monitor_id = ? "
-                         "AND ts >= ? ORDER BY ts", (monitor_id, since))
-        ok_ms = [s["ms"] for s in samples if s["ok"] and s["ms"] is not None]
+        # 24 hours: every check; longer ranges: per hour, with the average response time
+        history = monitor_history(db, monitor_id, since, hourly=days > 1)
+        last = db.all("SELECT ts, ok, ms FROM monitor_samples WHERE monitor_id = ? "
+                      "ORDER BY ts DESC LIMIT ?", (monitor_id, beat_count))
+        checks = sum(h["checks"] for h in history)
+        ms_count = sum(h["ms_count"] for h in history)
         return render_template(
             "monitor.html", m=m, range_days=days, ranges=status_ranges,
-            rt_chart=chart([{"points": [(s["ts"], s["ms"]) for s in samples if s["ok"]],
-                          "cls": "line-ok", "area": True}], since, now, tz, ymin=0,
+            rt_chart=chart([{"points": [(h["ts"], h["ms_sum"] / h["ms_count"])
+                                        for h in history if h["ms_count"]],
+                             "cls": "line-ok", "area": True}], since, now, tz, ymin=0,
                            width=640, height=180),
-            strip=availability(samples, since, now), beats=beats(samples),
+            strip=availability(history, since, now), beats=beats(last[::-1]),
             uptime=uptimes((1, 7, 30, 90), monitor_id).get(monitor_id, {}),
-            stats={"checks": len(samples), "failed": sum(1 for s in samples if not s["ok"]),
-                   "avg": round(sum(ok_ms) / len(ok_ms)) if ok_ms else None,
-                   "max": max(ok_ms, default=None)},
+            stats={"checks": checks, "failed": checks - sum(h["ok"] for h in history),
+                   "avg": round(sum(h["ms_sum"] for h in history) / ms_count)
+                   if ms_count else None,
+                   "max": max((h["ms_max"] for h in history if h["ms_count"]), default=None),
+                   "hourly": days > 1},
             alerts=db.all("SELECT * FROM alerts WHERE monitor_id = ? ORDER BY ts DESC, id DESC "
                           "LIMIT 10", (monitor_id,)),
             refresh=True, refresh_every=30)
