@@ -16,6 +16,8 @@ A server container runs behind your reverse proxy, and a small agent container o
 
 - **Every drive on one page**: status, temperature, power-on hours, wear and sector counts, grouped by host, with a history of up to a year
 - **Thresholds you set**, per drive type or per drive. A reallocated or pending sector means *Watch*, a growing count *Failing*
+- **Disk space** of the host's filesystems, matched to their drives, with a trend and a warning before one is full
+- **Status monitor**: the server checks your websites (HTTP and HTTPS with their certificate), TCP ports and hosts by ping, and tells you when one stops answering
 - **Missing updates**: drive firmware with a known bug, and missing security updates of Debian, Ubuntu and Alpine hosts ([details](docs/updates.md))
 - **Notifications** to Discord, mail and your own webhook, chosen per channel, plus a weekly report
 - **Small, safe agents**: about 30 MB of memory and next to no CPU, no open port, end-to-end encrypted, the network part runs without any privilege ([details](SECURITY.md#how-mimamori-is-secured))
@@ -53,6 +55,8 @@ On every host with drives to watch, including the server's host if it has some:
 
 **Optional:** to have the host checked for missing security updates, remove the `#` in front of its `volumes:` lines in `docker-compose.agent.yml`, recreate the agent, and turn the check on under **Settings → Updates** ([details](docs/updates.md)).
 
+**Optional:** to see how full the host's filesystems are, create an empty folder on each of them (e.g. `mkdir /srv/mimamori-fs`) and mount it read-only under `/host/fs/<name>`, as shown under `volumes:` in `docker-compose.agent.yml`. The agent only asks how full the filesystem under the folder is; it cannot read a single file of the host this way. This needs agent 0.3.2 or newer.
+
 ## Using it
 
 The **overview** shows every host with its drives. Drive problems and missing updates are ranked together as critical, medium or low, and the headline follows the worst of them. Click a drive for its history and thresholds, a host's name for its packages and updates. **Check now** makes every agent check within a minute.
@@ -65,6 +69,16 @@ The **overview** shows every host with its drives. Drive problems and missing up
 | **Missing** | The agent is online, but the drive was not in its last report |
 
 A few remapped sectors on an old drive can stay stable for years, a count that keeps rising cannot. That is why only growth counts as Failing.
+
+**Status** lists the websites and services the server checks itself. Add one with **Add a check** and choose what to check:
+
+| Check | What counts as up |
+|---|---|
+| **HTTP(S)** | The URL answers with one of the expected status codes (200-399 by default). Over `https://` the certificate can be verified, with a warning a chosen number of days before it expires; turn the verification off for a self-signed certificate |
+| **TCP port** | The port accepts a connection, optionally with a TLS handshake and a verified certificate (e.g. IMAPS, SMTPS) |
+| **Ping** | The host answers an ICMP echo request |
+
+A check counts as down after a number of failed checks in a row (2 by default), so one lost packet does not wake you up. Who gets told about down, back up and expiring certificates is chosen in **Settings → Notifications**, like everything else. The checks run on the server and see the network as it does: addresses in your home network work, loopback, link-local (`169.254.x.x`, cloud metadata) and multicast addresses are never checked, and redirects are not followed.
 
 If something does not work, see [Troubleshooting](docs/troubleshooting.md).
 

@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import badge, severity %}
+{% from "_macros.html" import badge, severity, fs_table %}
 {% block title %}{{ a.name }}{% endblock %}
 {% block content %}
 <a class="back" href="{{ url_for('overview') }}">← All drives</a>
@@ -26,8 +26,21 @@
   <div class="tile"><div class="label">Kernel running</div><div class="value small-value mono">{{ summary.os.kernel or '–' }}</div><div class="sub">{% if summary.os.reboot %}<span class="warn">reboot needed: {{ summary.os.reboot }} is installed</span>{% else %}since the last reboot{% endif %}</div></div>
   <div class="tile"><div class="label">Packages</div><div class="value">{{ packages|length if h else '–' }}</div><div class="sub">{% if h %}reported {{ h.reported|ago }}{% else %}not reported{% endif %}</div></div>
   <div class="tile"><div class="label">Missing updates</div><div class="value {{ 'crit' if summary.update_counts.high else 'warn' if summary.update_counts.middle else 'ok' if h and h.checked else '' }}">{{ summary.update_total if h and h.checked else '–' }}</div><div class="sub">{% if summary.update_total %}{{ summary.update_counts.high }} high · {{ summary.update_counts.middle }} middle · {{ summary.update_counts.low }} low{% elif h and h.checked %}none known{% else %}not checked yet{% endif %}</div></div>
+  <div class="tile"><div class="label">Disk space</div><div class="value {{ fullest.level if fullest }}">{{ fullest.percent ~ ' %' if fullest else '–' }}</div><div class="sub">{% if fullest %}{{ fullest.name }} is the fullest · {{ filesystems|length }} filesystem{{ 's' if filesystems|length != 1 }}{% else %}not reported{% endif %}</div></div>
   <div class="tile"><div class="label">Drive firmware</div><div class="value {{ 'warn' if summary.firmware_issues }}">{{ summary.firmware_issues }}</div><div class="sub">update{{ 's' if summary.firmware_issues != 1 }} recommended · {{ drives|length }} drive{{ 's' if drives|length != 1 }}</div></div>
 </div>
+
+<section class="section" id="storage">
+  <h2>Disk space</h2>
+  <div class="panel">
+    {% if filesystems %}
+    {{ fs_table(filesystems) }}
+    <p class="quiet small">Reported {{ filesystems[0].reported|ago }}. "Filling up" from {{ fs_limits.warn }} %, "almost full" from {{ fs_limits.crit }} % (<a href="{{ url_for('settings') }}#checks">Settings → Checks</a>). Like df, the space a filesystem reserves for root counts as neither used nor free.</p>
+    {% else %}
+    <p class="empty">This agent does not report disk space. To see it, create an empty folder on each filesystem of the host (for example <span class="mono">mkdir /srv/mimamori-fs</span>), mount each read-only into the agent under <span class="mono">/host/fs/&lt;name&gt;</span> (see <span class="mono">volumes</span> in docker-compose.agent.yml), then recreate the agent container. The agent can only see how full each filesystem is, not the files on it. This needs agent 0.3.2 or newer.</p>
+    {% endif %}
+  </div>
+</section>
 
 <section class="section">
   <h2>Missing security updates</h2>

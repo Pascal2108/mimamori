@@ -95,7 +95,7 @@ input, select {
 input:focus, select:focus, .btn:focus-visible, a:focus-visible {
   outline: 2px solid var(--jade); outline-offset: 1px;
 }
-input[type=checkbox] { width: auto; accent-color: var(--jade); }
+input[type=checkbox], input[type=radio] { width: auto; accent-color: var(--jade); }
 input.num { width: 90px; }
 label { display: block; font-size: 12.5px; color: var(--ash); margin-bottom: 4px; }
 .field { margin-bottom: 14px; }
@@ -161,6 +161,7 @@ main { max-width: 1240px; margin: 0 auto; padding: 28px 24px 64px; }
 .chip .dot { width: 6px; height: 6px; }
 .chip.warn { color: var(--gold); border-color: #6a5626; background: #2a2414; }
 .chip.quiet { color: var(--ash); }
+.chip.crit { color: var(--hi); border-color: #6b3237; background: #2a1519; }
 a.chip:hover { text-decoration: none; filter: brightness(1.15); }
 .card-note { color: var(--ash); font-size: 12.5px; line-height: 1.5; margin: 0 0 12px;
   padding: 10px 12px; border: 1px dashed var(--line); border-radius: 8px; }
@@ -324,6 +325,26 @@ details.confirm[open] .confirm-box { margin-top: 8px; }
 .check-progress progress::-webkit-progress-value { background: var(--jade); border-radius: 4px; }
 .check-progress progress::-moz-progress-bar { background: var(--jade); border-radius: 4px; }
 a.host-caption { display: block; }
+
+/* used space ------------------------------------------------------- */
+.usage { margin: 10px 0 2px; font-size: 12px; }
+.usage + .usage { margin-top: 6px; }
+.usage-text { display: flex; justify-content: space-between; gap: 8px; color: var(--ash); margin-bottom: 3px; }
+.usage-text .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usage-bar { display: block; width: 100%; height: 6px; border-radius: 3px; }
+.usage-bar .track { fill: var(--line-soft); }
+.usage-bar.ok .fill { fill: var(--jade); }
+.usage-bar.warn .fill { fill: var(--gold); }
+.usage-bar.crit .fill { fill: var(--hi); }
+.fs-card-bar { margin: 14px 0 12px; }
+.fs-card-bar .usage-bar { height: 8px; border-radius: 4px; }
+.usage-cell { min-width: 120px; }
+.usage-cell .usage-bar { margin-top: 4px; }
+.fs-table .spark { width: 120px; margin: 0 0 2px; }
+.spark.fs.ok polyline { stroke: var(--jade); }
+.spark.fs.warn polyline { stroke: var(--gold); }
+.spark.fs.crit polyline { stroke: var(--hi); }
+th.num, td.num { text-align: right; white-space: nowrap; }
 a.host-caption:hover { text-decoration: none; color: var(--paper); }
 .sev {
   display: inline-block; border-radius: 999px; padding: 1px 9px; font-size: 11px;
@@ -332,7 +353,7 @@ a.host-caption:hover { text-decoration: none; color: var(--paper); }
 }
 /* the ranking: updates and firmware gold, critical drive problems red */
 .sev.high { background: #3d3214; color: var(--gold); }
-.sev.high.drive, .sev.high.agent { background: #3a1f25; color: var(--hi); }
+.sev.high.drive, .sev.high.agent, .sev.high.storage { background: #3a1f25; color: var(--hi); }
 .sev.middle { background: #2b2a1e; color: #d8bd73; }
 .sev.low { background: #1c2a40; color: var(--ash); }
 .tile .value.small-value { font-size: 16px; overflow-wrap: anywhere; }
@@ -342,6 +363,41 @@ details.vulns ul { list-style: none; margin: 8px 0 0; padding: 0; display: grid;
 details summary.btn { list-style: none; margin-bottom: 10px; }
 details summary.btn::-webkit-details-marker { display: none; }
 .agent-row form.row { margin-bottom: 6px; }
+
+/* status monitor --------------------------------------------------- */
+.status-table td { vertical-align: middle; }
+.status-table .spark { display: inline-block; vertical-align: middle; width: 90px; height: 22px; margin: 0 8px 0 0; }
+.spark.ms polyline { stroke: var(--jade); }
+.target { color: var(--ash); font-size: 12px; overflow-wrap: anywhere; }
+.nowrap { white-space: nowrap; }
+.beats { display: block; width: 160px; height: 16px; }
+.strip { display: block; width: 100%; height: 28px; margin: 4px 0 10px; }
+.beats rect, .strip rect { fill: var(--line-soft); }
+.beats rect.ok, .strip rect.ok { fill: var(--jade); }
+.beats rect.fail, .strip rect.fail { fill: var(--hi); }
+.strip rect.part { fill: var(--gold); }
+.strip-legend i.ok { background: var(--jade); }
+.strip-legend i.part { background: var(--gold); }
+.strip-legend i.fail { background: var(--hi); }
+.strip-legend i.none { background: var(--line-soft); }
+.strip-legend i { height: 8px; width: 8px; border-radius: 2px; }
+.facts { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 14px 0 0; font-size: 13px; }
+.facts dt { color: var(--ash); }
+.facts dd { margin: 0; overflow-wrap: anywhere; }
+.form-panel { max-width: 860px; }
+.row .field.wide { flex: 3 1 320px; }
+.row .field.narrow { flex: 0 1 110px; }
+.kind-pick { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-bottom: 6px; }
+.kind-pick .check { margin: 0; }
+.hint { margin: 4px 0 0; }
+/* Show only the fields of the chosen kind (browsers without :has show all of them) */
+.monitor-form:has(#k-http:checked) :is(.only-tcp, .only-ping, .only-host) { display: none; }
+.monitor-form:has(#k-tcp:checked) :is(.only-http, .only-ping) { display: none; }
+.monitor-form:has(#k-ping:checked) :is(.only-http, .only-tcp, .only-tls) { display: none; }
+.row.only-tls { align-items: center; }
+.status-rows { display: none; }
+.status-rows .drow { margin-bottom: 8px; }
+.status-rows .drow .temp { font-size: 15px; }
 
 /* login ------------------------------------------------------------ */
 .login { max-width: 360px; margin: 10vh auto; padding: 0 16px; }
@@ -373,4 +429,6 @@ details summary.btn::-webkit-details-marker { display: none; }
   .rows { display: block; }
   .charts { grid-template-columns: 1fr; }
   .drive-head h1 { font-size: 22px; }
+  .status-wide { display: none; }
+  .status-rows { display: block; }
 }

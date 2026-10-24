@@ -70,6 +70,10 @@
         <div class="field"><label for="ao">Agent counts as offline after (minutes)</label><input id="ao" name="agent_offline_minutes" type="number" min="3" max="1440" value="{{ s.agent_offline_minutes }}" required></div>
         <div class="field"><label for="gw">Growth compares with (days ago)</label><input id="gw" name="growth_window_days" type="number" min="1" max="90" value="{{ s.growth_window_days }}" required></div>
       </div>
+      <div class="row">
+        <div class="field"><label for="fw">Disk space is filling up at (% used)</label><input id="fw" name="fs_warn_percent" type="number" min="50" max="99" value="{{ s.fs_warn_percent }}" required></div>
+        <div class="field"><label for="fc">Disk space is almost full at (% used)</label><input id="fc" name="fs_crit_percent" type="number" min="51" max="100" value="{{ s.fs_crit_percent }}" required></div>
+      </div>
       <p class="quiet small">Drives in standby are not woken up for a check. Times are shown in {{ tz_name }} (set <span class="mono">TZ</span> in docker-compose.yml to change it).</p>
       <button class="btn primary" type="submit">Save</button>
     </form>
@@ -156,7 +160,7 @@
         </tbody>
       </table>
       </div>
-      <p class="quiet small">Drive issues: <b>high</b> is Failing (a critical threshold, a failed SMART check) or a drive that stopped responding; <b>middle</b> is Watch for sectors, media errors and wear; <b>low</b> is Watch for temperature and cable CRC errors, which usually mean the room or the cable. Missing updates are rated by the distribution or by their CVSS score; drive firmware with a known bug counts as an update.</p>
+      <p class="quiet small">Drive issues: <b>high</b> is Failing (a critical threshold, a failed SMART check) or a drive that stopped responding; <b>middle</b> is Watch for sectors, media errors and wear; <b>low</b> is Watch for temperature and cable CRC errors, which usually mean the room or the cable. Missing updates are rated by the distribution or by their CVSS score; drive firmware with a known bug counts as an update. The status monitor is <b>critical</b> when a site or service stops answering as expected, and <b>medium</b> when its certificate expires soon (see <a href="{{ url_for('status_page') }}">Status</a>).</p>
       <button class="btn primary" type="submit">Save</button>
     </form>
   </div>

@@ -2,7 +2,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
   <meta name="theme-color" content="#0F1A2B">
-  {% if refresh %}<meta http-equiv="refresh" content="10">{% endif %}{# while an update check waits or runs #}
+  {% if refresh %}<meta http-equiv="refresh" content="{{ refresh_every or 10 }}">{% endif %}{# while an update check waits or runs, and on the status pages #}
   <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml">
   <link rel="icon" href="/favicon.ico" sizes="32x32">
   <link rel="apple-touch-icon" href="{{ url_for('static', filename='icon-180.png') }}">

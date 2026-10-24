@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% from "_macros.html" import monitor_badge, beats_bar, percent %}
+{% block title %}Status{% endblock %}
+{% block content %}
+<p class="date">Status monitor</p>
+<h1 class="headline">{% if not monitors %}Nothing is watched yet.{% elif counts.down %}{{ counts.down }} of {{ monitors|length }} {{ 'does' if counts.down == 1 else 'do' }} not answer.{% elif counts.up == monitors|length %}Everything answers.{% else %}{{ counts.up }} of {{ monitors|length }} answer.{% endif %}</h1>
+
+<div class="tiles four">
+  <div class="tile"><div class="label">Up</div><div class="value ok">{{ counts.up }}</div><div class="sub">answering as expected</div></div>
+  <div class="tile"><div class="label">Down</div><div class="value {{ 'crit' if counts.down }}">{{ counts.down }}</div><div class="sub">{{ 'no answer or a wrong one' if counts.down else 'none' }}</div></div>
+  <div class="tile"><div class="label">Waiting or paused</div><div class="value">{{ counts.pending + counts.paused }}</div><div class="sub">{{ counts.pending }} waiting for the first check · {{ counts.paused }} paused</div></div>
+  {% set certs = monitors|selectattr('tls_days', 'ne', none)|list %}
+  {% set soonest = certs|sort(attribute='tls_days')|first if certs else none %}
+  <div class="tile"><div class="label">Next certificate to expire</div>
+    {% if soonest %}<div class="value {{ 'warn' if soonest.tls_level }}">{{ soonest.tls_days }} days</div><div class="sub">{{ soonest.name }}</div>
+    {% else %}<div class="value">–</div><div class="sub">no certificate checked</div>{% endif %}</div>
+</div>
+
+<div class="panel">
+  <div class="panel-head">
+    <h2>Sites and services</h2>
+    <a class="btn primary" href="{{ url_for('monitor_new') }}">Add a check</a>
+  </div>
+  {% if monitors %}
+  <div class="table-wrap status-wide">
+  <table class="status-table">
+    <thead><tr><th>Status</th><th>Check</th><th>Last {{ 40 }} checks</th><th>Response, 24 h</th><th class="num">Up 24 h</th><th class="num">30 days</th><th>Certificate</th><th>Checked</th></tr></thead>
+    <tbody>
+    {% for m in monitors %}
+    <tr>
+      <td>{{ monitor_badge(m) }}</td>
+      <td><a href="{{ url_for('monitor_page', monitor_id=m.id) }}">{{ m.name }}</a>
+        <div class="target"><span class="mono">{{ m.display }}</span> · {{ m.kind_label }}{% if m.muted %} · muted{% endif %}</div>
+        {% if m.state == 'down' or (m.state == 'up' and m.fail_count) %}<div class="small {{ 'crit' if m.state == 'down' else 'warn' }}">{{ m.last_error }}</div>{% endif %}</td>
+      <td>{{ beats_bar(m.beats) }}</td>
+      <td class="nowrap">{% if m.spark %}<svg class="spark ms" viewBox="0 0 180 28" preserveAspectRatio="none" aria-hidden="true"><polyline points="{{ m.spark }}"></polyline></svg>{% endif %}<span class="small">{{ m.last_ms ~ ' ms' if m.last_ms is not none and m.state != 'down' else '–' }}</span></td>
+      <td class="num">{{ percent(m.uptime.get(1)) }}</td>
+      <td class="num">{{ percent(m.uptime.get(30)) }}</td>
+      <td class="small">{% if m.tls_days is not none %}<span class="{{ 'warn' if m.tls_level }}">{{ m.tls_days }} days left</span>{% elif m.kind == 'ping' or (m.kind == 'http' and not m.target.startswith('https:')) or (m.kind == 'tcp' and not m.check_tls) %}<span class="quiet">no TLS</span>{% elif not m.check_tls %}<span class="quiet">not verified</span>{% else %}<span class="quiet">–</span>{% endif %}</td>
+      <td class="small quiet nowrap">{{ m.last_check|ago }}<div>every {{ m.interval_label }}</div></td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {# narrow screens: compact rows #}
+  <div class="status-rows">
+    {% for m in monitors %}
+    <a class="drow {{ {'down': 'failing'}.get(m.state, 'watch' if m.tls_level or (m.state == 'up' and m.fail_count) else '') }}" href="{{ url_for('monitor_page', monitor_id=m.id) }}">
+      <span class="dot {{ {'up': 'ok', 'down': 'crit'}.get(m.state, 'missing') }}"></span>
+      <div>
+        <div class="t">{{ m.name }}</div>
+        <div class="s">{% if m.state == 'down' %}{{ m.last_error }}{% elif m.state in ('pending', 'paused') %}{{ m.state|capitalize }} · {{ m.display }}{% else %}{{ percent(m.uptime.get(30)) }} up in 30 days{% if m.tls_level %} · certificate: {{ m.tls_days }} days left{% endif %}{% endif %}</div>
+      </div>
+      <span class="temp">{{ m.last_ms ~ ' ms' if m.last_ms is not none and m.state == 'up' else '' }}</span>
+    </a>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="empty">mimamori can check websites (HTTP and HTTPS, with their certificate), TCP ports and hosts by ping, and tell you through the channels in <a href="{{ url_for('settings') }}#notifications">Settings → Notifications</a> when one stops answering.</p>
+  {% endif %}
+</div>
+<p class="quiet small">The checks run on the mimamori server, so they see the network as the server does. Addresses in your home network work; loopback, link-local (169.254.x.x) and multicast addresses are never checked. Redirects are not followed: a 301 or 302 counts as its own status code.</p>
+{% endblock %}

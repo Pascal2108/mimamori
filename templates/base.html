@@ -5,7 +5,7 @@
   <title>{% block title %}mimamori{% endblock %} · mimamori</title>
 </head>
 <body>
-{% set nav = [('overview', 'Overview'), ('alerts', 'Alerts'), ('report_page', 'Weekly report'), ('settings', 'Settings')] %}
+{% set nav = [('overview', 'Overview'), ('status_page', 'Status'), ('alerts', 'Alerts'), ('report_page', 'Weekly report'), ('settings', 'Settings')] %}
 {% if logged_in %}
 <header class="top">
   <div class="top-inner">
@@ -15,7 +15,7 @@
     </a>
     <nav class="nav" aria-label="Main">
       {% for endpoint, label in nav %}
-      <a href="{{ url_for(endpoint) }}" class="{{ 'active' if request.endpoint == endpoint or (endpoint == 'overview' and request.endpoint in ('drive', 'host')) }}">{{ label }}</a>
+      <a href="{{ url_for(endpoint) }}" class="{{ 'active' if request.endpoint == endpoint or (endpoint == 'overview' and request.endpoint in ('drive', 'host')) or (endpoint == 'status_page' and request.endpoint and request.endpoint.startswith('monitor_')) }}">{{ label }}</a>
       {% endfor %}
     </nav>
     <div class="top-right">

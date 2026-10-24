@@ -18,6 +18,7 @@ import datetime as dt
 import hashlib
 import hmac
 import html
+import http.client
 import ipaddress
 import json
 import logging
@@ -26,8 +27,10 @@ import queue
 import re
 import secrets
 import smtplib
+import socket
 import sqlite3
 import ssl
+import struct
 import sys
 import threading
 import time
@@ -584,6 +587,62 @@ CREATE TABLE IF NOT EXISTS vulns (
     data TEXT NOT NULL,
     fetched INTEGER NOT NULL
 );
+-- Added in 0.3.2: used space of the host's filesystems (agents from 0.3.2 on, when mounted)
+CREATE TABLE IF NOT EXISTS filesystems (
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    fstype TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    block TEXT NOT NULL DEFAULT '',
+    disks TEXT NOT NULL DEFAULT '[]',
+    total INTEGER NOT NULL,
+    used INTEGER NOT NULL,
+    free INTEGER NOT NULL,
+    level TEXT NOT NULL DEFAULT '',
+    reported INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, name)
+);
+CREATE TABLE IF NOT EXISTS fs_samples (
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    used INTEGER NOT NULL,
+    total INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS fs_samples_name_ts ON fs_samples (agent_id, name, ts);
+-- Added in 0.3.2: the status monitor, websites and services the server checks itself
+CREATE TABLE IF NOT EXISTS monitors (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,                       -- http, tcp or ping
+    target TEXT NOT NULL,                     -- the URL (http) or host name / address
+    port INTEGER,                             -- tcp
+    expect TEXT NOT NULL DEFAULT '200-399',   -- http: the status codes that count as up
+    check_tls INTEGER NOT NULL DEFAULT 1,     -- verify the certificate (https, tcp)
+    tls_warn_days INTEGER NOT NULL DEFAULT 14,
+    interval INTEGER NOT NULL DEFAULT 60,     -- seconds between checks
+    timeout INTEGER NOT NULL DEFAULT 10,      -- seconds
+    failures INTEGER NOT NULL DEFAULT 2,      -- failed checks in a row before it is down
+    paused INTEGER NOT NULL DEFAULT 0,
+    muted INTEGER NOT NULL DEFAULT 0,
+    created INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',   -- pending, up or down
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    last_check INTEGER,
+    last_change INTEGER,
+    last_ms INTEGER,
+    last_code INTEGER,
+    last_error TEXT NOT NULL DEFAULT '',
+    tls_expires INTEGER,
+    tls_level TEXT NOT NULL DEFAULT ''        -- warn while the certificate expires soon
+);
+CREATE TABLE IF NOT EXISTS monitor_samples (
+    monitor_id INTEGER NOT NULL REFERENCES monitors(id) ON DELETE CASCADE,
+    ts INTEGER NOT NULL,
+    ok INTEGER NOT NULL,
+    ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS monitor_samples_ts ON monitor_samples (monitor_id, ts);
 """
 
 
@@ -593,6 +652,8 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("drives", "firmware_issue", "TEXT NOT NULL DEFAULT '{}'"),
     # 1: the drive's temperature sensor is faulty; readings are kept but not evaluated or shown
     ("drives", "temp_ignored", "INTEGER NOT NULL DEFAULT 0"),
+    # Alerts of the status monitor (0.3.2), which belong to no agent
+    ("alerts", "monitor_id", "INTEGER REFERENCES monitors(id) ON DELETE CASCADE"),
 ]
 
 
@@ -684,7 +745,8 @@ ALERT_LABELS = {
     "new_issue": "New issue", "worsened": "Worsened", "resolved": "Resolved",
     "missing": "Missing", "back": "Back", "agent_offline": "Agent offline",
     "agent_online": "Agent online", "test": "Test", "report": "Weekly report",
-    "updates": "Missing updates", "firmware": "Firmware",
+    "updates": "Missing updates", "firmware": "Firmware", "storage": "Disk space",
+    "monitor_down": "Down", "monitor_up": "Up", "monitor_tls": "Certificate",
 }
 CHANNELS = ("Discord", "mail", "webhook")
 SEVERITIES = ("low", "middle", "high")
@@ -701,7 +763,12 @@ NOTIFY_TOPICS: dict[str, tuple[str, bool]] = {
     "updates_high": ("Missing updates · critical", True),
     "updates_middle": ("Missing updates · medium", True),
     "updates_low": ("Missing updates · low", False),
-    "agent": ("Agent offline or back online", True),
+    "storage_high": ("Disk space · critical: almost full", True),
+    "storage_middle": ("Disk space · medium: filling up", True),
+    "monitor_high": ("Status monitor · critical: site or service down", True),
+    "monitor_middle": ("Status monitor · medium: certificate expires soon", True),
+    "monitor_ok": ("Status monitor: back up, certificate renewed", True),
+    "agent":("Agent offline or back online", True),
     "report": ("Weekly report", True),
 }
 # Usually the room or the cable, not the drive itself
@@ -1029,6 +1096,89 @@ def parse_host(raw: Any) -> dict | None:
     return {"os": info, "packages": packages}
 
 
+FS_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+BLOCK_NAME = re.compile(r"^[A-Za-z0-9][\w.-]{0,63}$")
+MAX_FILESYSTEMS = 32
+MAX_BYTES = 1 << 62  # far beyond any filesystem; keeps hostile numbers out of SQLite
+
+
+def parse_filesystems(raw: Any) -> list[dict] | None:
+    """The "filesystems" part of an agent report, checked and bounded. None when the agent
+    sent none (older agents, or nothing mounted under /host/fs): then nothing changes."""
+    if not isinstance(raw, list):
+        return None
+    out: dict[str, dict] = {}
+    for item in raw[:MAX_FILESYSTEMS]:
+        if not isinstance(item, dict) or not FS_NAME.match(str(item.get("name", ""))):
+            continue
+        sizes = [_num(item.get(k)) for k in ("total", "used", "free")]
+        if any(n is None or not 0 <= n <= MAX_BYTES for n in sizes) or not sizes[0]:
+            continue
+        disks = item.get("disks") if isinstance(item.get("disks"), list) else []
+        block = clean_text(item.get("block"), 64)
+        out[item["name"]] = {
+            "name": item["name"], "fstype": clean_text(item.get("fstype"), 32),
+            "source": clean_text(item.get("source"), 200),
+            "block": block if BLOCK_NAME.match(block) else "",
+            "disks": sorted({d for d in disks[:16] if isinstance(d, str) and BLOCK_NAME.match(d)}),
+            "total": sizes[0], "used": min(sizes[1], sizes[0]), "free": min(sizes[2], sizes[0])}
+    return list(out.values())
+
+
+def fs_percent(fs: dict) -> int:
+    """Used space in percent, rounded up like df; the space reserved for root counts as
+    neither used nor free."""
+    room = fs["used"] + fs["free"]
+    return min(100, -(-fs["used"] * 100 // room)) if room else 0
+
+
+def fs_level(percent: int, warn: int, crit: int) -> str:
+    return "crit" if percent >= crit else "warn" if percent >= warn else ""
+
+
+def disk_device(block: str) -> str:
+    """The device smartctl reports for a whole disk: sda -> /dev/sda, nvme0n1 -> /dev/nvme0."""
+    m = re.fullmatch(r"(nvme\d+)n\d+", block)
+    return f"/dev/{m.group(1) if m else block}"
+
+
+def fs_trend(points: Sequence[tuple[int, int]], free: int) -> dict | None:
+    """How fast a filesystem fills: the change of its used space per week over the points
+    (ts, used), and when it would be full at that pace. None for less than two days."""
+    if len(points) < 2 or points[-1][0] - points[0][0] < 2 * DAY:
+        return None
+    (t0, u0), (t1, u1) = points[0], points[-1]
+    per_day = (u1 - u0) / ((t1 - t0) / DAY)
+    return {"per_week": int(per_day * 7), "days": (t1 - t0) // DAY,
+            "full_in_days": int(free / per_day) if per_day > 0 else None}
+
+
+def load_filesystems(db: "Database", warn: int, crit: int,
+                     agent_id: str | None = None) -> dict[str, list[dict]]:
+    """agent id -> its filesystems, each with percent, level and the drive devices it is on."""
+    out: dict[str, list[dict]] = defaultdict(list)
+    rows = db.all("SELECT * FROM filesystems WHERE ? IS NULL OR agent_id = ? "
+                  "ORDER BY name COLLATE NOCASE", (agent_id, agent_id))
+    for r in rows:
+        fs = dict(r)
+        fs["disks"] = json.loads(fs["disks"])
+        fs["devices"] = [disk_device(d) for d in fs["disks"]]
+        fs["percent"] = fs_percent(fs)
+        fs["level"] = fs_level(fs["percent"], warn, crit)
+        out[fs["agent_id"]].append(fs)
+    return out
+
+
+def human_bytes(n: int | None) -> str:
+    if n is None:
+        return ""
+    for unit, size in (("TB", 10**12), ("GB", 10**9), ("MB", 10**6)):
+        if n >= size:
+            v = n / size
+            return f"{v:.0f} {unit}" if v >= 10 or v == int(v) else f"{v:.1f} {unit}"
+    return f"{n} B"
+
+
 def _dpkg_order(c: str) -> int:
     if c.isdigit():
         return 0
@@ -1264,10 +1414,340 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "notify_rules": {},  # channel -> topic -> bool; missing entries use NOTIFY_TOPICS
     # Off until turned on: it sends package lists to an outside service (api.osv.dev)
     "updates_check_enabled": False,
+    # A filesystem is filling up (medium) or almost full (critical) at this percentage used
+    "fs_warn_percent": 85,
+    "fs_crit_percent": 95,
     # Part of every session; logging out raises it, which ends every session at once. The
     # session lives only in the signed cookie, so this is how the server can revoke it.
     "session_generation": 0,
 }
+
+
+# ============================================================================
+# Status monitor: the server itself checks websites and services (HTTP(S), TCP, ping).
+# The targets are typed in on the page, so they are treated as hostile input: only http(s)
+# URLs and plain host names or addresses, no credentials in URLs, no redirects followed, and
+# never loopback, link-local (cloud metadata), multicast or reserved addresses. Addresses in
+# the home network are allowed on purpose, since that is what most people want to watch.
+# The connection goes to the address that was checked, so DNS cannot swap it in between.
+# ============================================================================
+
+MONITOR_KINDS = {"http": "HTTP(S)", "tcp": "TCP port", "ping": "Ping"}
+MONITOR_INTERVALS = {30: "30 seconds", 60: "1 minute", 120: "2 minutes", 300: "5 minutes",
+                     600: "10 minutes", 1800: "30 minutes", 3600: "1 hour"}
+MAX_MONITORS = 100
+MONITOR_WORKERS = 8
+MONITOR_SAMPLE_DAYS = 90
+MAX_URL = 2048
+_LABEL = r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?"
+HOST_NAME = re.compile(rf"^(?=.{{1,253}}$){_LABEL}(?:\.{_LABEL})*\.?$")
+URL_CHARS = re.compile(r"^[\x21-\x7e]+$")
+# Cloud metadata services outside link-local, and "this network"
+BLOCKED_NETWORKS = [ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "100.100.100.200/32", "fd00:ec2::254/128")]
+
+
+class ProbeError(Exception):
+    """A check that failed, with a message for the page and the notification."""
+
+
+def check_host(raw: str) -> str:
+    """A host name or IP address as typed in, or ValueError. IPv6 may come in brackets."""
+    host = raw.strip()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    if not HOST_NAME.match(host) or host.replace(".", "").isdigit():
+        raise ValueError("Enter a host name like example.com or an IP address (names with "
+                         "accents in their punycode form, xn--…).")
+    return host.lower().rstrip(".")
+
+
+def check_url(raw: str) -> str:
+    """An http(s) URL as typed in, or ValueError."""
+    url = raw.strip()
+    if not url or len(url) > MAX_URL or not URL_CHARS.match(url):
+        raise ValueError("Enter a URL like https://example.com/ (no spaces; names with "
+                         "accents in their punycode form, xn--…).")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme.lower() not in ("http", "https"):
+        raise ValueError("The URL must start with https:// or http://.")
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        # They would end up in the database and on the page
+        raise ValueError("The URL must not contain a user name or password.")
+    try:
+        parts.port
+    except ValueError:
+        raise ValueError("The port in the URL is not valid.") from None
+    check_host(parts.hostname or "")
+    return urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc, parts.path or "/",
+                                    parts.query, ""))
+
+
+def parse_expect(raw: str) -> str:
+    """Status codes like "200-399" or "200,204,301-302", normalized, or ValueError."""
+    out = []
+    for part in raw.replace(" ", "").split(","):
+        lo, dash, hi = part.partition("-")
+        if not lo.isdigit() or (dash and not hi.isdigit()):
+            raise ValueError("Status codes look like 200-399 or 200,204,301.")
+        a, b = int(lo), int(hi or lo)
+        if not 100 <= a <= b <= 599:
+            raise ValueError("Status codes are between 100 and 599.")
+        out.append(f"{a}-{b}" if a != b else str(a))
+    if not out or len(out) > 20:
+        raise ValueError("Enter one to twenty status codes or ranges.")
+    return ",".join(out)
+
+
+def code_expected(code: int, expect: str) -> bool:
+    for part in expect.split(","):
+        lo, _, hi = part.partition("-")
+        if int(lo) <= code <= int(hi or lo):
+            return True
+    return False
+
+
+NAT64 = ipaddress.ip_network("64:ff9b::/96")
+
+
+def address_allowed(address: str) -> bool:
+    ip = ipaddress.ip_address(address.split("%", 1)[0])
+    if isinstance(ip, ipaddress.IPv6Address):
+        # An IPv4 address inside IPv6 is checked as that address, so a gateway cannot be
+        # used to reach a blocked one: mapped and NAT64 (DNS64 networks) stand for it,
+        # 6to4 has to pass as well
+        if ip.ipv4_mapped or ip in NAT64:
+            ip = ip.ipv4_mapped or ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        elif ip.sixtofour and not address_allowed(str(ip.sixtofour)):
+            return False
+    return not (ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified
+                or ip.is_reserved or any(ip in n for n in BLOCKED_NETWORKS))
+
+
+def resolve(host: str, port: int | None) -> list[tuple[int, tuple]]:
+    """The addresses of a host, all of them allowed, or ProbeError."""
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (socket.gaierror, UnicodeError):
+        raise ProbeError(f"{host} was not found (DNS)") from None
+    out: list[tuple[int, tuple]] = []
+    for family, _, _, _, addr in infos:
+        if family in (socket.AF_INET, socket.AF_INET6) and (family, addr) not in out:
+            out.append((family, addr))
+    if not out:
+        raise ProbeError(f"{host} has no IPv4 or IPv6 address")
+    for _, addr in out:
+        if not address_allowed(addr[0]):
+            where = addr[0] if addr[0] == host else f"{host} points to {addr[0]}"
+            raise ProbeError(f"{where}: mimamori does not check loopback, link-local, "
+                             "multicast or reserved addresses")
+    return out[:4]
+
+
+def _connect(addrs: list[tuple[int, tuple]], timeout: float) -> socket.socket:
+    error: Exception | None = None
+    for family, addr in addrs:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(addr)
+            return sock
+        except OSError as exc:
+            sock.close()
+            error = exc
+    raise error or OSError("no address")
+
+
+def _tls(sock: socket.socket, host: str, verify: bool) -> tuple[ssl.SSLSocket, int | None]:
+    """The TLS handshake; with verify, the certificate must be valid for the host, and its
+    expiry is returned."""
+    ctx = ssl.create_default_context()
+    if not verify:  # e.g. a self-signed certificate in the home network
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    tls = ctx.wrap_socket(sock, server_hostname=host)
+    cert = tls.getpeercert() if verify else None
+    expires = int(ssl.cert_time_to_seconds(cert["notAfter"])) \
+        if cert and cert.get("notAfter") else None
+    return tls, expires
+
+
+class _Deadline:
+    """A hard limit for a whole check: the socket timeout applies to each read only, so a
+    server that sends one byte at a time could otherwise hold a worker for hours."""
+
+    def __init__(self, seconds: float):
+        self.seconds = seconds
+        self.sock: socket.socket | None = None
+        self.expired = False
+        self._timer = threading.Timer(seconds, self._expire)
+        self._timer.daemon = True
+
+    def __enter__(self) -> "_Deadline":
+        self._timer.start()
+        return self
+
+    def _expire(self) -> None:
+        self.expired = True
+        try:
+            if self.sock is not None:
+                self.sock.shutdown(socket.SHUT_RDWR)  # wakes up a blocked read
+        except OSError:
+            pass
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._timer.cancel()
+        # Also without an error: the cut-off answer may have looked complete
+        if self.expired:
+            raise ProbeError(f"No complete answer within {self.seconds:.0f} s") from None
+
+
+def _probe_error(exc: BaseException, timeout: int) -> str:
+    if isinstance(exc, ProbeError):
+        return str(exc)
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return f"Certificate not valid: {exc.verify_message or exc.reason}"
+    if isinstance(exc, ssl.SSLError):
+        return f"TLS handshake failed: {exc.reason or type(exc).__name__}"
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return f"No answer within {timeout} s"
+    if isinstance(exc, ConnectionRefusedError):
+        return "Connection refused"
+    if isinstance(exc, ConnectionResetError):
+        return "Connection reset"
+    if isinstance(exc, http.client.HTTPException):
+        return f"Not a valid HTTP answer ({type(exc).__name__})"
+    if isinstance(exc, OSError):
+        return exc.strerror or type(exc).__name__
+    return type(exc).__name__
+
+
+def probe_http(m: dict) -> dict:
+    parts = urllib.parse.urlsplit(m["target"])
+    https = parts.scheme == "https"
+    host = parts.hostname or ""
+    port = parts.port or (443 if https else 80)
+    addrs = resolve(host, port)
+    start = time.monotonic()
+    sock: socket.socket = _connect(addrs, m["timeout"])
+    expires = None
+    try:
+        with _Deadline(m["timeout"] * 2) as deadline:
+            deadline.sock = sock
+            if https:
+                sock, expires = _tls(sock, host, bool(m["check_tls"]))
+                deadline.sock = sock
+            conn = http.client.HTTPConnection(host, port, timeout=m["timeout"])
+            conn.sock = sock  # already connected to the checked address
+            path = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
+            conn.request("GET", path, headers={
+                "Host": parts.netloc, "User-Agent": f"mimamori/{VERSION} (status monitor)",
+                "Accept": "*/*", "Connection": "close"})
+            resp = conn.getresponse()  # only the status line and headers, never the body
+            code = resp.status
+            ms = int((time.monotonic() - start) * 1000)
+            resp.close()
+    finally:
+        sock.close()
+    ok = code_expected(code, m["expect"])
+    return {"ok": ok, "ms": ms, "code": code, "tls_expires": expires,
+            "error": "" if ok else f"HTTP {code}, expected {m['expect']}"}
+
+
+def probe_tcp(m: dict) -> dict:
+    addrs = resolve(m["target"], m["port"])
+    start = time.monotonic()
+    sock: socket.socket = _connect(addrs, m["timeout"])
+    expires = None
+    try:
+        with _Deadline(m["timeout"] * 2) as deadline:
+            deadline.sock = sock
+            if m["check_tls"]:
+                sock, expires = _tls(sock, m["target"], True)
+            ms = int((time.monotonic() - start) * 1000)
+    finally:
+        sock.close()
+    return {"ok": True, "ms": ms, "code": None, "tls_expires": expires, "error": ""}
+
+
+def _icmp_checksum(data: bytes) -> int:
+    if len(data) % 2:
+        data += b"\0"
+    s = sum(struct.unpack(f"!{len(data) // 2}H", data))
+    s = (s >> 16) + (s & 0xFFFF)
+    return ~(s + (s >> 16)) & 0xFFFF
+
+
+def probe_ping(m: dict) -> dict:
+    """One ICMP echo over an unprivileged ping socket: the container needs no capability,
+    only the sysctl net.ipv4.ping_group_range, which Docker sets by default."""
+    family, addr = resolve(m["target"], None)[0]
+    v6 = family == socket.AF_INET6
+    try:
+        sock = socket.socket(family, socket.SOCK_DGRAM,
+                             socket.IPPROTO_ICMPV6 if v6 else socket.IPPROTO_ICMP)
+    except PermissionError:
+        raise ProbeError("Ping is not allowed in this container "
+                         "(sysctl net.ipv4.ping_group_range)") from None
+    with sock:
+        seq = secrets.randbelow(0xFFFF)
+        payload = b"mimamori" + secrets.token_bytes(8)
+        kind = 128 if v6 else 8
+        header = struct.pack("!BBHHH", kind, 0, 0, 0, seq)
+        # The kernel sets the identifier (and for IPv6 the checksum) of a ping socket
+        packet = struct.pack("!BBHHH", kind, 0, 0 if v6 else _icmp_checksum(header + payload),
+                             0, seq) + payload
+        start = time.monotonic()
+        deadline = start + m["timeout"]
+        sock.sendto(packet, addr)
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError
+            sock.settimeout(left)
+            data = sock.recv(1024)
+            if len(data) >= 8 and data[0] == (129 if v6 else 0) \
+                    and struct.unpack("!H", data[6:8])[0] == seq and data[8:] == payload:
+                break
+    return {"ok": True, "ms": int((time.monotonic() - start) * 1000), "code": None,
+            "tls_expires": None, "error": ""}
+
+
+PROBES = {"http": probe_http, "tcp": probe_tcp, "ping": probe_ping}
+
+
+def run_probe(m: dict) -> dict:
+    """Checks one monitor; never raises."""
+    try:
+        return PROBES[m["kind"]](m)
+    except Exception as exc:  # every failure is a result
+        return {"ok": False, "ms": None, "code": None, "tls_expires": None,
+                "error": _probe_error(exc, m["timeout"])[:200]}
+
+
+def monitor_target(m: dict) -> str:
+    """The target for pages and notifications: an URL without its query (which may carry a
+    token), or host and port."""
+    if m["kind"] == "http":
+        parts = urllib.parse.urlsplit(m["target"])
+        return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    host = f"[{m['target']}]" if ":" in m["target"] else m["target"]
+    return f"{host}:{m['port']}" if m["kind"] == "tcp" else m["target"]
+
+
+def human_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 90:
+        return f"{seconds} s"
+    if seconds < 5400:
+        return f"{round(seconds / 60)} min"
+    if seconds < 2 * DAY:
+        return f"{round(seconds / 3600)} h"
+    return f"{round(seconds / DAY)} days"
 
 
 def kind_label(kind: str) -> str:
@@ -1318,6 +1798,10 @@ class Monitor:
         # Agent id -> percent done of the update check running right now, for the page
         self._progress: dict[str, int] = {}
         self._progress_lock = threading.Lock()
+        # Status monitor: the ids being checked right now, so none is checked twice at once
+        self._monitor_running: set[int] = set()
+        self._monitor_lock = threading.Lock()
+        self._monitor_pool = ThreadPoolExecutor(MONITOR_WORKERS, thread_name_prefix="status")
 
     def clock(self, ts: int) -> str:
         return dt.datetime.fromtimestamp(ts, self.tz).strftime("%H:%M")
@@ -1372,6 +1856,7 @@ class Monitor:
                    for rec in [parse_smart(item.get("smartctl"), clean_text(item.get("device")))]
                    if rec]
         host = parse_host(payload.get("host"))  # agents from 0.2.2 on, when mounted
+        filesystems = parse_filesystems(payload.get("filesystems"))  # from 0.3.2 on
         now = int(time.time())
         pending_alerts: list[tuple] = []
         seen_ids: set[int] = set()
@@ -1394,6 +1879,8 @@ class Monitor:
                            checked = CASE WHEN hosts.packages_hash = excluded.packages_hash
                                      THEN hosts.checked END""",
                     (agent["id"], json.dumps(host["os"]), packages, digest, now))
+            if filesystems is not None:
+                pending_alerts += self._store_filesystems(conn, agent, filesystems, now)
             for rec in records:
                 if not rec["serial"]:
                     if rec["standby"] and rec["device"]:
@@ -1455,8 +1942,53 @@ class Monitor:
                                        {"drive_high"}))
 
         for drive, kind, level, title, detail, topics in pending_alerts:
-            self._alert(agent["id"], dict(drive), kind, level, title, detail, topics=topics)
+            self._alert(agent["id"], dict(drive) if drive else None, kind, level, title, detail,
+                        topics=topics)
         return len(seen_ids)
+
+    def _store_filesystems(self, conn, agent: dict, filesystems: list[dict],
+                           now: int) -> list[tuple]:
+        """Keeps the reported filesystems (and forgets those no longer mounted), records their
+        history and returns an alert for each one that crossed a limit."""
+        warn, crit = int(self.setting("fs_warn_percent")), int(self.setting("fs_crit_percent"))
+        old = {r["name"]: r["level"] for r in conn.execute(
+            "SELECT name, level FROM filesystems WHERE agent_id = ?", (agent["id"],))}
+        names = [f["name"] for f in filesystems]
+        conn.execute(f"DELETE FROM filesystems WHERE agent_id = ? AND name NOT IN "
+                     f"({','.join('?' * len(names))})", (agent["id"], *names))
+        alerts = []
+        for fs in filesystems:
+            percent = fs_percent(fs)
+            level = fs_level(percent, warn, crit)
+            conn.execute(
+                """INSERT INTO filesystems (agent_id, name, fstype, source, block, disks, total,
+                                            used, free, level, reported)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (agent_id, name) DO UPDATE SET
+                       fstype = excluded.fstype, source = excluded.source,
+                       block = excluded.block, disks = excluded.disks, total = excluded.total,
+                       used = excluded.used, free = excluded.free, level = excluded.level,
+                       reported = excluded.reported""",
+                (agent["id"], fs["name"], fs["fstype"], fs["source"], fs["block"],
+                 json.dumps(fs["disks"]), fs["total"], fs["used"], fs["free"], level, now))
+            conn.execute("INSERT INTO fs_samples (agent_id, name, ts, used, total) "
+                         "VALUES (?, ?, ?, ?, ?)",
+                         (agent["id"], fs["name"], now, fs["used"], fs["total"]))
+            before = old.get(fs["name"], "")
+            if level == before:
+                continue
+            where = f"{fs['name']} on {agent['name']}"
+            free = f"{human_bytes(fs['free'])} free of {human_bytes(fs['total'])}"
+            if level == "crit" or (level == "warn" and not before):
+                alerts.append((None, "storage", level,
+                               f"{where} is {'almost full' if level == 'crit' else 'filling up'}"
+                               f": {percent} % used", f"{free}.",
+                               {"storage_high" if level == "crit" else "storage_middle"}))
+            elif before:  # fell below the limit it had crossed
+                alerts.append((None, "resolved", "ok", f"{where}: {percent} % used",
+                               f"Below the {'critical' if before == 'crit' else 'warning'} "
+                               f"limit again; {free}.", {"recovery"}))
+        return alerts
 
     def _apply_issues(self, conn, drive, issues: dict) -> list[tuple]:
         old = json.loads(drive["issues"])
@@ -1480,30 +2012,36 @@ class Monitor:
                      (json.dumps(issues), status_of(issues), summary_of(issues), drive["id"]))
         return out
 
-    def _alert(self, agent_id: str, drive: dict | None, kind: str, level: str,
-               title: str, detail: str, topics: set[str] | None = None) -> None:
+    def _alert(self, agent_id: str | None, drive: dict | None, kind: str, level: str,
+               title: str, detail: str, topics: set[str] | None = None,
+               monitor: dict | None = None) -> None:
         """Records an alert and sends it to the channels that want one of its `topics`
-        (see NOTIFY_TOPICS); without topics to every channel."""
+        (see NOTIFY_TOPICS); without topics to every channel. Alerts of the status monitor
+        pass `monitor` instead of an agent."""
         alert_id = self.db.execute(
-            "INSERT INTO alerts (ts, agent_id, drive_id, kind, level, title, detail) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (int(time.time()), agent_id, drive["id"] if drive else None, kind, level, title,
-             detail)).lastrowid
-        if drive and drive.get("muted"):
+            "INSERT INTO alerts (ts, agent_id, drive_id, monitor_id, kind, level, title, "
+            "detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (int(time.time()), agent_id, drive["id"] if drive else None,
+             monitor["id"] if monitor else None, kind, level, title, detail)).lastrowid
+        if (drive and drive.get("muted")) or (monitor and monitor.get("muted")):
             return
         only = self.channels_for(topics)
         if only is not None and not set(only) & set(self.notifier.configured()):
             return  # recorded and shown, but no channel wants it
-        # An agent on a compromised host must not be able to flood your channels: past the
-        # limit, alerts are still recorded and shown, but not sent
-        recent = self.db.one("SELECT COUNT(*) AS n FROM alerts WHERE agent_id = ? AND ts > ? "
+        # An agent on a compromised host (or a flapping website) must not be able to flood
+        # your channels: past the limit, alerts are still recorded and shown, but not sent
+        who, ident = ("monitor_id", monitor["id"]) if monitor else ("agent_id", agent_id)
+        recent = self.db.one(f"SELECT COUNT(*) AS n FROM alerts WHERE {who} = ? AND ts > ? "
                              "AND channels != 'not sent: limit'",
-                             (agent_id, int(time.time()) - 3600))["n"]
+                             (ident, int(time.time()) - 3600))["n"]
         if recent > NOTIFY_LIMIT_PER_HOUR:
             self.db.execute("UPDATE alerts SET channels = 'not sent: limit' WHERE id = ?",
                             (alert_id,))
-            log.warning("More than %d alerts within an hour from one agent; not sending more",
-                        NOTIFY_LIMIT_PER_HOUR)
+            log.warning("More than %d alerts within an hour from one %s; not sending more",
+                        NOTIFY_LIMIT_PER_HOUR, "monitor" if monitor else "agent")
+            return
+        if monitor:
+            self._monitor_event(alert_id, monitor, kind, level, title, detail, topics, only)
             return
         agent = self.db.one("SELECT name FROM agents WHERE id = ?", (agent_id,))
         host = agent["name"] if agent else "unknown host"
@@ -1529,6 +2067,8 @@ class Monitor:
             label = "Offline"
         elif kind in ("updates", "firmware"):
             label = f"Update {severity}"
+        elif kind == "storage":
+            label = "Almost full" if level == "crit" else "Filling up"
         ev = make_event(kind, level, f"{label} · {title}", detail, fields=fields, footer=footer,
                         url=url, extra={"host": host, "severity": severity,
                                         "topics": sorted(topics or ()), "drive": {
@@ -1540,6 +2080,121 @@ class Monitor:
                             (", ".join(channels), alert_id))
 
         self.notifier.send(ev, done, only=only)
+
+    def _monitor_event(self, alert_id: int, monitor: dict, kind: str, level: str, title: str,
+                       detail: str, topics: set[str] | None, only: list[str] | None) -> None:
+        label = {"monitor_down": "Down", "monitor_up": "Up"}.get(kind) or (
+            "Renewed" if level == "ok" else "Certificate")
+        target = monitor_target(monitor)
+        ev = make_event(
+            kind, level, f"{label} · {title}", detail,
+            fields={"Check": MONITOR_KINDS.get(monitor["kind"], monitor["kind"]),
+                    "Target": target},
+            footer="mimamori · status monitor",
+            url=f"{self.cfg.public_url}/status/{monitor['id']}" if self.cfg.public_url else "",
+            extra={"host": "", "severity": topics_severity(topics),
+                   "topics": sorted(topics or ()), "drive": None,
+                   "monitor": {"name": monitor["name"], "kind": monitor["kind"],
+                               "target": target}})
+
+        def done(channels: list[str]) -> None:
+            self.db.execute("UPDATE alerts SET channels = ? WHERE id = ?",
+                            (", ".join(channels), alert_id))
+
+        self.notifier.send(ev, done, only=only)
+
+    # status monitor -------------------------------------------------------
+    def _status_loop(self) -> None:
+        while not self._stop.wait(5):
+            try:
+                self.run_due_monitors()
+            except Exception:  # keep the thread alive
+                log.exception("Status monitor failed")
+
+    def run_due_monitors(self) -> None:
+        for row in self.db.all("SELECT id FROM monitors WHERE paused = 0 AND "
+                               "(last_check IS NULL OR last_check + interval <= ?)",
+                               (int(time.time()),)):
+            self.check_monitor_soon(row["id"])
+
+    def check_monitor_soon(self, monitor_id: int) -> None:
+        """Checks a monitor on the worker threads, unless it is being checked already."""
+        with self._monitor_lock:
+            if monitor_id in self._monitor_running:
+                return
+            self._monitor_running.add(monitor_id)
+        self._monitor_pool.submit(self._monitor_job, monitor_id)
+
+    def _monitor_job(self, monitor_id: int) -> None:
+        try:
+            self.check_monitor(monitor_id)
+        except Exception:
+            log.exception("Status check failed")
+        finally:
+            with self._monitor_lock:
+                self._monitor_running.discard(monitor_id)
+
+    def check_monitor(self, monitor_id: int) -> dict | None:
+        row = self.db.one("SELECT * FROM monitors WHERE id = ?", (monitor_id,))
+        if row is None:
+            return None
+        result = run_probe(dict(row))
+        self.record_probe(monitor_id, result)
+        return result
+
+    def record_probe(self, monitor_id: int, result: dict, now: int | None = None) -> None:
+        """Stores one check and alerts when the monitor went down, came back up, or its
+        certificate started to expire soon or was renewed."""
+        now = now or int(time.time())
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT * FROM monitors WHERE id = ?", (monitor_id,)).fetchone()
+            if row is None:  # removed while it was being checked
+                return
+            m = dict(row)
+            if result["ok"]:
+                fails, status = 0, "up"
+            else:  # down only after `failures` failed checks in a row
+                fails = m["fail_count"] + 1
+                status = "down" if fails >= m["failures"] else m["status"]
+            expires, tls_level = m["tls_expires"], m["tls_level"]
+            if result["tls_expires"] is not None:
+                expires = result["tls_expires"]
+                tls_level = "warn" if expires - now < m["tls_warn_days"] * DAY else ""
+            elif result["ok"]:  # up without a certificate check: nothing to warn about
+                expires, tls_level = None, ""
+            conn.execute(
+                "UPDATE monitors SET status = ?, fail_count = ?, last_check = ?, "
+                "last_change = CASE WHEN status != ? THEN ? ELSE last_change END, "
+                "last_ms = ?, last_code = ?, last_error = ?, tls_expires = ?, tls_level = ? "
+                "WHERE id = ?",
+                (status, fails, now, status, now, result["ms"], result["code"],
+                 result["error"], expires, tls_level, monitor_id))
+            conn.execute("INSERT INTO monitor_samples (monitor_id, ts, ok, ms) VALUES (?, ?, ?, ?)",
+                         (monitor_id, now, 1 if result["ok"] else 0, result["ms"]))
+        name = m["name"]
+        alerts = []
+        if status != m["status"] and status == "down":
+            alerts.append(("monitor_down", "crit", f"{name} is down",
+                           f"{result['error'] or 'No answer'} ({fails} failed check"
+                           f"{'s' if fails != 1 else ''} in a row).", {"monitor_high"}))
+        elif status != m["status"] and m["status"] == "down":
+            down = f"Down for {human_duration(now - m['last_change'])}; " \
+                if m["last_change"] else ""
+            alerts.append(("monitor_up", "ok", f"{name} is back up",
+                           f"{down}answered in {result['ms']} ms.", {"monitor_ok"}))
+        if tls_level != m["tls_level"] and result["tls_expires"] is not None:
+            until = dt.datetime.fromtimestamp(expires, self.tz).strftime("%d %b %Y")
+            if tls_level == "warn":
+                days = max(0, (expires - now) // DAY)
+                alerts.append(("monitor_tls", "warn", f"The certificate of {name} expires in "
+                               f"{days} day{'s' if days != 1 else ''}",
+                               f"Valid until {until}. Renew it before then, or visitors get "
+                               "a warning.", {"monitor_middle"}))
+            else:
+                alerts.append(("monitor_tls", "ok", f"The certificate of {name} was renewed",
+                               f"Valid until {until}.", {"monitor_ok"}))
+        for kind, level, title, detail, topics in alerts:
+            self._alert(None, None, kind, level, title, detail, topics=topics, monitor=m)
 
     # drives ---------------------------------------------------------------
     def reevaluate(self, drive_id: int) -> None:
@@ -1574,6 +2229,7 @@ class Monitor:
         threading.Thread(target=self._loop, name="scheduler", daemon=True).start()
         # On its own thread: a check can take minutes and must not delay the offline alerts
         threading.Thread(target=self._updates_loop, name="updates", daemon=True).start()
+        threading.Thread(target=self._status_loop, name="status", daemon=True).start()
 
     def _updates_loop(self) -> None:
         while not self._stop.wait(60):
@@ -1778,6 +2434,10 @@ class Monitor:
         with self.db.transaction() as conn:
             conn.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
             conn.execute("DELETE FROM alerts WHERE ts < ?", (cutoff,))
+            conn.execute("DELETE FROM fs_samples WHERE ts < ?", (cutoff,))
+            # One row per check adds up quickly: the status monitor keeps 90 days
+            conn.execute("DELETE FROM monitor_samples WHERE ts < ?",
+                         (max(cutoff, now - MONITOR_SAMPLE_DAYS * DAY),))
             # The full attribute tables are only needed for recent history
             conn.execute("UPDATE samples SET attrs = NULL WHERE ts < ? AND attrs IS NOT NULL",
                          (now - 35 * DAY,))
@@ -1858,8 +2518,34 @@ def build_report(monitor: Monitor) -> dict:
             levels.append(fw["level"])
             updates.append(f"{d['model']} {d['device']} on {d['host']}: firmware update "
                            f"recommended ({SEVERITY_NAMES[fw['level']]})")
+    warn, crit = int(monitor.setting("fs_warn_percent")), int(monitor.setting("fs_crit_percent"))
+    names = {r["id"]: r["name"] for r in monitor.db.all("SELECT id, name FROM agents")}
+    storage = []
+    for agent_id, filesystems in load_filesystems(monitor.db, warn, crit).items():
+        for fs in filesystems:
+            if fs["level"]:
+                levels.append("high" if fs["level"] == "crit" else "middle")
+                storage.append(f"{fs['name']} on {names.get(agent_id, '')}: {fs['percent']} % "
+                               f"used, {human_bytes(fs['free'])} free")
+    monitors = []
+    now = int(time.time())
+    for m in monitor.db.all(
+            "SELECT m.*, (SELECT AVG(ok) FROM monitor_samples s WHERE s.monitor_id = m.id "
+            "AND s.ts >= ?) AS uptime FROM monitors m WHERE paused = 0 "
+            "ORDER BY name COLLATE NOCASE", (since,)):
+        up = f" ({m['uptime'] * 100:.2f} % up this week)" if m["uptime"] is not None else ""
+        if m["status"] == "down":
+            levels.append("high")
+            monitors.append(f"{m['name']} is down: {m['last_error'] or 'no answer'}{up}")
+        elif m["tls_level"] and m["tls_expires"]:
+            levels.append("middle")
+            days = max(0, (m["tls_expires"] - now) // DAY)
+            monitors.append(f"The certificate of {m['name']} expires in {days} "
+                            f"day{'s' if days != 1 else ''}{up}")
+        elif m["uptime"] is not None and m["uptime"] < 1:
+            monitors.append(f"{m['name']}: {m['uptime'] * 100:.2f} % up this week")
     worst = worst_rank(levels)
-    if not drives and not levels:
+    if not drives and not levels and not monitors:
         headline = "No drives reported yet."
     elif worst is None:
         headline = "The pond is calm. Every drive is healthy, no update is missing."
@@ -1867,7 +2553,7 @@ def build_report(monitor: Monitor) -> dict:
         n = len(levels)
         headline = f"{POND[worst]} {n} thing{'s' if n != 1 else ''} need{'s' if n == 1 else ''} attention."
     return {
-        "updates": updates, "worst": worst,
+        "updates": updates, "storage": storage, "monitors": monitors, "worst": worst,
         "generated": int(time.time()), "since": since, "drives": drives, "alerts": alerts,
         "counts": {s: sum(1 for d in drives if d["status"] == s) for s in STATUS_ORDER},
         "warmest": max((d for d in drives if d["max_temp"] is not None),
@@ -1879,7 +2565,7 @@ def build_report(monitor: Monitor) -> dict:
 def report_event(data: dict, public_url: str) -> dict:
     lines = [f"{d['status'].upper()} · {d['model']} {d['device']} on {d['host']}: "
              f"{d['summary'] or 'see details'}" for d in data["attention"]]
-    lines += data["updates"]
+    lines += data["updates"] + data.get("storage", []) + data.get("monitors", [])
     lines = lines or ["Nothing needs your attention."]
     lines.append(f"{len(data['alerts'])} alert(s) this week.")
     c = data["counts"]
@@ -1913,6 +2599,12 @@ def _report_html(data: dict, level: str) -> str:
     updates = "".join(f'<li style="color:#C9D2DE">{e(u)}</li>' for u in data["updates"][:30])
     updates = ('<h3 style="color:#EDF1F6;margin:20px 0 8px">Missing updates</h3>'
                f'<ul style="padding-left:18px;font-size:14px">{updates}</ul>') if updates else ""
+    storage = "".join(f'<li style="color:#C9D2DE">{e(u)}</li>' for u in data.get("storage", [])[:30])
+    updates += ('<h3 style="color:#EDF1F6;margin:20px 0 8px">Disk space</h3>'
+                f'<ul style="padding-left:18px;font-size:14px">{storage}</ul>') if storage else ""
+    status = "".join(f'<li style="color:#C9D2DE">{e(u)}</li>' for u in data.get("monitors", [])[:30])
+    updates += ('<h3 style="color:#EDF1F6;margin:20px 0 8px">Status monitor</h3>'
+                f'<ul style="padding-left:18px;font-size:14px">{status}</ul>') if status else ""
     return ('<div style="background:#0B1220;padding:24px;font-family:sans-serif">'
             f'<div style="background:#131F33;border-top:4px solid #{COLORS[level]:06X};'
             'border-radius:8px;padding:16px">'
@@ -2008,7 +2700,7 @@ def chart(series: list[dict], t0: int, t1: int, tz: dt.tzinfo, *, width: int = 4
 
     def label(ts: int) -> str:
         d = dt.datetime.fromtimestamp(ts, tz)
-        return f"{d.day} {d.strftime('%b')}"
+        return d.strftime("%H:%M") if span_t <= 2 * DAY else f"{d.day} {d.strftime('%b')}"
 
     return {
         "w": width, "h": height, "left": left, "right": width - right, "lines": lines,
@@ -2189,15 +2881,6 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         if s < 3600:
             return f"{s // 60} min ago"
         return f"{s // 3600} h ago" if s < DAY else f"{s // DAY} days ago"
-
-    def human_bytes(n: int | None) -> str:
-        if not n:
-            return ""
-        for unit, size in (("TB", 10**12), ("GB", 10**9), ("MB", 10**6)):
-            if n >= size:
-                v = n / size
-                return f"{v:.0f} {unit}" if v >= 10 or v == int(v) else f"{v:.1f} {unit}"
-        return f"{n} B"
 
     app.jinja_env.filters.update(
         time=fmt_time, ago=ago, bytes=human_bytes, kind=kind_label,
@@ -2445,12 +3128,34 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             by_agent[d["agent_id"]].append(d)
         hosts = {r["agent_id"]: r for r in db.all("SELECT agent_id, os_info, updates, checked "
                                                   "FROM hosts")}
+        filesystems = fs_by_agent()
         for a in agents:
             a["online"] = agent_is_online(a)
             a["drives"] = sorted(by_agent.get(a["id"], []),
                                  key=lambda d: (STATUS_ORDER.get(d["status"], 9), d["device"]))
             a.update(host_summary(hosts.get(a["id"]), a["drives"]))
+            a["filesystems"] = filesystems.get(a["id"], [])
+            a["fs_elsewhere"] = attach_filesystems(a["drives"], a["filesystems"])
         return agents, drives
+
+    def fs_by_agent(agent_id: str | None = None) -> dict[str, list[dict]]:
+        return load_filesystems(db, int(monitor.setting("fs_warn_percent")),
+                                int(monitor.setting("fs_crit_percent")), agent_id)
+
+    def attach_filesystems(drives: list[dict], filesystems: list[dict]) -> list[dict]:
+        """Gives each drive the filesystems on it (d["fs"]), and each filesystem links to its
+        drives (fs["drives"]). Returns those on no known drive (ZFS, virtual disks)."""
+        by_device = {d["device"]: d for d in drives}
+        elsewhere = []
+        for d in drives:
+            d["fs"] = []
+        for fs in filesystems:
+            fs["drives"] = [by_device[dev] for dev in fs["devices"] if dev in by_device]
+            for d in fs["drives"]:
+                d["fs"].append(fs)
+            if not fs["drives"]:
+                elsewhere.append(fs)
+        return elsewhere
 
     def host_summary(host: sqlite3.Row | None, drives: list[dict]) -> dict:
         updates = json.loads(host["updates"]) if host else []
@@ -2472,7 +3177,8 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
 
         def add(level: str, kind: str, count: int, host: str, text: str, url: str) -> None:
             tone = "quiet" if level == "low" else \
-                "crit" if level == "high" and kind in ("drive", "agent") else "warn"
+                "crit" if level == "high" and kind in ("drive", "agent", "storage", "monitor") \
+                else "warn"
             items.append({"level": level, "kind": kind, "count": count, "host": host,
                           "text": text, "url": url, "tone": tone})
 
@@ -2484,6 +3190,13 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             if a["os"].get("reboot"):  # a kernel update is installed, but not running yet
                 add("middle", "updates", 1, a["name"], f"{a['name']}: reboot to run the "
                     f"installed kernel update ({a['os']['reboot']})", url)
+            for fs in a["filesystems"]:
+                if fs["level"]:
+                    add("high" if fs["level"] == "crit" else "middle", "storage", 1, a["name"],
+                        f"{fs['name']} on {a['name']} is "
+                        f"{'almost full' if fs['level'] == 'crit' else 'filling up'}: "
+                        f"{fs['percent']} % used, {human_bytes(fs['free'])} free",
+                        url + "#storage")
             for level in reversed(SEVERITIES):
                 if n := a["update_counts"][level]:
                     add(level, "updates", n, a["name"], f"{a['name']}: {n} {SEVERITY_NAMES[level]} "
@@ -2496,6 +3209,17 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             if d["fw"]:
                 add(d["fw"]["level"], "firmware", 1, host,
                     f"{drive_name(d)} on {host}: firmware update recommended", url)
+        now = int(time.time())
+        for m in db.all("SELECT * FROM monitors WHERE paused = 0 AND "
+                        "(status = 'down' OR tls_level != '') ORDER BY name COLLATE NOCASE"):
+            url = url_for("monitor_page", monitor_id=m["id"])
+            if m["status"] == "down":
+                add("high", "monitor", 1, "", f"{m['name']} is down: "
+                    f"{m['last_error'] or 'no answer'}", url)
+            if m["tls_level"] and m["tls_expires"]:
+                days = max(0, (m["tls_expires"] - now) // DAY)
+                add("middle", "monitor", 1, "", f"The certificate of {m['name']} expires in "
+                    f"{days} day{'s' if days != 1 else ''}", url)
         items.sort(key=lambda i: -SEVERITIES.index(i["level"]))
         return items
 
@@ -2508,7 +3232,7 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             "levels": {lvl: sum(i["count"] for i in items if i["level"] == lvl)
                        for lvl in reversed(SEVERITIES)},
             "kinds": {k: sum(i["count"] for i in items if i["kind"] == k)
-                      for k in ("updates", "drive", "firmware", "agent")},
+                      for k in ("updates", "drive", "firmware", "agent", "storage", "monitor")},
             "hosts": list(dict.fromkeys(i["host"] for i in items if i["host"])),
         }
 
@@ -2549,14 +3273,33 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
                                           "ORDER BY device", (agent_id,))]
         for d in drives:
             d["fw"] = json.loads(d["firmware_issue"])
+        filesystems = fs_by_agent(agent_id).get(agent_id, [])
+        attach_filesystems(drives, filesystems)
+        add_history(agent_id, filesystems)
         return render_template(
             "host.html", a=agent, h=dict(row) if row else None, drives=drives,
+            filesystems=filesystems,
+            fullest=max(filesystems, key=lambda f: f["percent"], default=None),
+            fs_limits={"warn": monitor.setting("fs_warn_percent"),
+                       "crit": monitor.setting("fs_crit_percent")},
             summary=(summary := host_summary(row, drives)),
             refresh=summary["update_progress"] is not None or summary["update_queued"],
             updates=json.loads(row["updates"]) if row else [],
             packages=json.loads(row["packages"]) if row else [],
             check_enabled=monitor.setting("updates_check_enabled"),
             next_check=(row["checked"] + UPDATE_CHECK_SECONDS) if row and row["checked"] else None)
+
+    def add_history(agent_id: str, filesystems: list[dict]) -> None:
+        """The last 30 days of each filesystem: a sparkline of its percentage and its trend."""
+        since = int(time.time()) - 30 * DAY
+        points: dict[str, list] = defaultdict(list)
+        for r in db.all("SELECT name, ts, used, total FROM fs_samples WHERE agent_id = ? "
+                        "AND ts >= ? ORDER BY ts", (agent_id, since)):
+            points[r["name"]].append((r["ts"], r["used"], r["total"]))
+        for fs in filesystems:
+            pts = points.get(fs["name"], [])
+            fs["spark"] = sparkline([(t, u * 100 / s) for t, u, s in pts if s])
+            fs["trend"] = fs_trend([(t, u) for t, u, _ in pts], fs["free"])
 
     @app.post("/host/<agent_id>/check-updates")
     def host_check_updates(agent_id: str):
@@ -2587,6 +3330,9 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             "SELECT * FROM samples WHERE drive_id = ? AND attrs IS NOT NULL ORDER BY ts LIMIT 1",
             (drive_id,))
         week_ago = dict(week_ago) if week_ago else {}
+        filesystems = fs_by_agent(d["agent_id"]).get(d["agent_id"], [])
+        attach_filesystems([d], filesystems)
+        add_history(d["agent_id"], d["fs"])
         thresholds = monitor.thresholds_for(d)
         temp_limits = thresholds["temp"].get(d["kind"]) or thresholds["temp"]["unknown"]
 
@@ -2728,6 +3474,226 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         return render_template("alerts.html", alerts=rows[:per], page=page,
                                has_next=len(rows) > per)
 
+    # status monitor -------------------------------------------------------
+    status_order = {"down": 0, "pending": 1, "up": 2, "paused": 3}
+    status_ranges = {"1": 1, "7": 7, "30": 30, "90": 90}
+    beat_count = 40
+
+    def get_monitor(monitor_id: int) -> dict:
+        row = db.one("SELECT * FROM monitors WHERE id = ?", (monitor_id,))
+        if row is None:
+            abort(404)
+        return dict(row)
+
+    def monitor_view(m: dict, now: int) -> dict:
+        m["display"] = monitor_target(m)
+        m["kind_label"] = MONITOR_KINDS.get(m["kind"], m["kind"])
+        m["state"] = "paused" if m["paused"] else m["status"]
+        m["tls_days"] = max(0, (m["tls_expires"] - now) // DAY) if m["tls_expires"] else None
+        m["interval_label"] = MONITOR_INTERVALS.get(m["interval"], f"{m['interval']} s")
+        return m
+
+    def uptimes(days: Sequence[int], monitor_id: int | None = None) -> dict[int, dict]:
+        """monitor id -> {days: share of checks that were up, or None without checks}"""
+        now = int(time.time())
+        cols = ", ".join(f"AVG(CASE WHEN ts >= {now - d * DAY} THEN ok END) AS u{d}"
+                         for d in days)
+        rows = db.all(f"SELECT monitor_id, {cols} FROM monitor_samples WHERE ts >= ? "
+                      "AND (? IS NULL OR monitor_id = ?) GROUP BY monitor_id",
+                      (now - max(days) * DAY, monitor_id, monitor_id))
+        return {r["monitor_id"]: {d: r[f"u{d}"] for d in days} for r in rows}
+
+    def beats(samples: Sequence[sqlite3.Row]) -> list[dict]:
+        """The last checks as small bars, the newest on the right."""
+        last = list(samples)[-beat_count:]
+        offset = beat_count - len(last)
+        return [{"x": (offset + i) * 4, "cls": "ok" if s["ok"] else "fail",
+                 "title": f"{fmt_time(s['ts'])}: " + (f"up, {s['ms']} ms" if s["ok"] else "down")}
+                for i, s in enumerate(last)]
+
+    def availability(samples: Sequence[sqlite3.Row], t0: int, t1: int,
+                     buckets: int = 90) -> list[dict]:
+        """The range in `buckets` slices: all up, partly down, down, or no checks."""
+        counts = [[0, 0] for _ in range(buckets)]
+        span = max(t1 - t0, 1)
+        for s in samples:
+            i = min(buckets - 1, max(0, (s["ts"] - t0) * buckets // span))
+            counts[i][0 if s["ok"] else 1] += 1
+        out = []
+        for i, (up, down) in enumerate(counts):
+            cls = "none" if not up and not down else "fail" if not up else "part" if down else "ok"
+            start = t0 + span * i // buckets
+            text = "no checks" if cls == "none" else f"{up} up, {down} down"
+            out.append({"x": i * 4, "cls": cls, "title": f"from {fmt_time(start)}: {text}"})
+        return out
+
+    @app.get("/status")
+    def status_page():
+        now = int(time.time())
+        rows = [monitor_view(dict(r), now) for r in db.all(
+            "SELECT * FROM monitors ORDER BY name COLLATE NOCASE")]
+        up = uptimes((1, 30))
+        for m in rows:
+            samples = db.all("SELECT ts, ok, ms FROM monitor_samples WHERE monitor_id = ? "
+                             "AND ts >= ? ORDER BY ts", (m["id"], now - DAY))
+            m["beats"] = beats(samples)
+            m["spark"] = sparkline([(s["ts"], s["ms"]) for s in samples if s["ok"]])
+            m["uptime"] = up.get(m["id"], {})
+        rows.sort(key=lambda m: status_order.get(m["state"], 9))
+        counts = {s: sum(1 for m in rows if m["state"] == s) for s in status_order}
+        return render_template("status.html", monitors=rows, counts=counts,
+                               refresh=True, refresh_every=30)
+
+    @app.get("/status/<int:monitor_id>")
+    def monitor_page(monitor_id: int):
+        now = int(time.time())
+        m = monitor_view(get_monitor(monitor_id), now)
+        days = status_ranges.get(request.args.get("range", "1"), 1)
+        since = now - days * DAY
+        samples = db.all("SELECT ts, ok, ms FROM monitor_samples WHERE monitor_id = ? "
+                         "AND ts >= ? ORDER BY ts", (monitor_id, since))
+        ok_ms = [s["ms"] for s in samples if s["ok"] and s["ms"] is not None]
+        return render_template(
+            "monitor.html", m=m, range_days=days, ranges=status_ranges,
+            rt_chart=chart([{"points": [(s["ts"], s["ms"]) for s in samples if s["ok"]],
+                          "cls": "line-ok", "area": True}], since, now, tz, ymin=0,
+                           width=640, height=180),
+            strip=availability(samples, since, now), beats=beats(samples),
+            uptime=uptimes((1, 7, 30, 90), monitor_id).get(monitor_id, {}),
+            stats={"checks": len(samples), "failed": sum(1 for s in samples if not s["ok"]),
+                   "avg": round(sum(ok_ms) / len(ok_ms)) if ok_ms else None,
+                   "max": max(ok_ms, default=None)},
+            alerts=db.all("SELECT * FROM alerts WHERE monitor_id = ? ORDER BY ts DESC, id DESC "
+                          "LIMIT 10", (monitor_id,)),
+            refresh=True, refresh_every=30)
+
+    def monitor_form() -> tuple[dict, str]:
+        """The fields of the add/edit form, and an error message for the form ("" if none)."""
+        f = request.form
+        kind = f.get("kind", "") if f.get("kind", "") in MONITOR_KINDS else "http"
+        values: dict[str, Any] = {
+            "name": clean_text(f.get("name", ""), 48), "kind": kind,
+            "target": f.get("target", "").strip()[:MAX_URL], "port": None,
+            "expect": f.get("expect", "").strip()[:100] or "200-399",
+            "check_tls": 1 if f.get("check_tls") else 0,
+            "tls_warn_days": form_int("tls_warn_days", 1, 90),
+            "interval": form_int("interval", 30, 3600), "timeout": form_int("timeout", 1, 30),
+            "failures": form_int("failures", 1, 10)}
+        try:
+            if not values["name"]:
+                raise ValueError("Give the check a name.")
+            if values["interval"] not in MONITOR_INTERVALS:
+                raise ValueError("Choose how often to check from the list.")
+            if kind == "http":
+                values["target"] = check_url(values["target"])
+                values["expect"] = parse_expect(values["expect"])
+            else:
+                values["target"] = check_host(values["target"][:260])
+                values["expect"] = "200-399"  # only HTTP has status codes
+            if kind == "tcp":
+                raw = f.get("port", "").strip()
+                if not raw.isdigit() or not 1 <= int(raw) <= 65535:
+                    raise ValueError("A TCP check needs a port between 1 and 65535.")
+                values["port"] = int(raw)
+        except ValueError as exc:
+            return values, str(exc)
+        return values, ""
+
+    def render_monitor_form(m: dict, error: str = "", code: int = 200):
+        if error:
+            flash(error, "error")
+        return render_template("monitor_form.html", m=m, kinds=MONITOR_KINDS,
+                               intervals=MONITOR_INTERVALS), code
+
+    @app.get("/status/new")
+    def monitor_new():
+        return render_monitor_form({"name": "", "kind": "http", "target": "", "port": None,
+                                    "expect": "200-399", "check_tls": 1, "tls_warn_days": 14,
+                                    "interval": 60, "timeout": 10, "failures": 2})
+
+    @app.post("/status/new")
+    def monitor_create():
+        values, error = monitor_form()
+        if not error and db.one("SELECT COUNT(*) AS n FROM monitors")["n"] >= MAX_MONITORS:
+            error = f"mimamori checks at most {MAX_MONITORS} sites and services."
+        if error:
+            return render_monitor_form(values, error, 400)
+        monitor_id = db.execute(
+            "INSERT INTO monitors (name, kind, target, port, expect, check_tls, tls_warn_days, "
+            "interval, timeout, failures, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (values["name"], values["kind"], values["target"], values["port"],
+             values["expect"], values["check_tls"], values["tls_warn_days"],
+             values["interval"], values["timeout"], values["failures"],
+             int(time.time()))).lastrowid
+        log.info("Status check %s added", values["name"])
+        monitor.check_monitor_soon(monitor_id)
+        flash(f"{values['name']} is checked now and then every "
+              f"{MONITOR_INTERVALS[values['interval']]}.")
+        return redirect(url_for("monitor_page", monitor_id=monitor_id))
+
+    @app.get("/status/<int:monitor_id>/edit")
+    def monitor_edit(monitor_id: int):
+        return render_monitor_form(get_monitor(monitor_id))
+
+    @app.post("/status/<int:monitor_id>/edit")
+    def monitor_save(monitor_id: int):
+        old = get_monitor(monitor_id)
+        values, error = monitor_form()
+        if error:
+            return render_monitor_form(dict(values, id=monitor_id), error, 400)
+        # Something else is checked now: start over, without "back up" or "renewed" alerts
+        fresh = any(old[k] != values[k] for k in ("kind", "target", "port", "check_tls"))
+        with db.transaction() as conn:
+            conn.execute(
+                "UPDATE monitors SET name = ?, kind = ?, target = ?, port = ?, expect = ?, "
+                "check_tls = ?, tls_warn_days = ?, interval = ?, timeout = ?, failures = ? "
+                "WHERE id = ?",
+                (values["name"], values["kind"], values["target"], values["port"],
+                 values["expect"], values["check_tls"], values["tls_warn_days"],
+                 values["interval"], values["timeout"], values["failures"], monitor_id))
+            if fresh:
+                conn.execute("UPDATE monitors SET status = 'pending', fail_count = 0, "
+                             "last_change = NULL, tls_expires = NULL, tls_level = '' "
+                             "WHERE id = ?", (monitor_id,))
+        monitor.check_monitor_soon(monitor_id)
+        flash("Check saved.")
+        return redirect(url_for("monitor_page", monitor_id=monitor_id))
+
+    @app.post("/status/<int:monitor_id>/check")
+    def monitor_check(monitor_id: int):
+        get_monitor(monitor_id)
+        monitor.check_monitor_soon(monitor_id)
+        flash("Checking now. The result shows up within a few seconds.")
+        return redirect(url_for("monitor_page", monitor_id=monitor_id))
+
+    @app.post("/status/<int:monitor_id>/pause")
+    def monitor_pause(monitor_id: int):
+        m = get_monitor(monitor_id)
+        db.execute("UPDATE monitors SET paused = ?, fail_count = 0 WHERE id = ?",
+                   (0 if m["paused"] else 1, monitor_id))
+        if m["paused"]:
+            monitor.check_monitor_soon(monitor_id)
+        flash("Checks resumed." if m["paused"] else
+              "Paused: it is not checked until you resume it.")
+        return redirect(url_for("monitor_page", monitor_id=monitor_id))
+
+    @app.post("/status/<int:monitor_id>/mute")
+    def monitor_mute(monitor_id: int):
+        m = get_monitor(monitor_id)
+        db.execute("UPDATE monitors SET muted = ? WHERE id = ?",
+                   (0 if m["muted"] else 1, monitor_id))
+        flash("Alerts unmuted." if m["muted"] else
+              "Alerts muted. They still show up here, but no notifications are sent.")
+        return redirect(url_for("monitor_page", monitor_id=monitor_id))
+
+    @app.post("/status/<int:monitor_id>/delete")
+    def monitor_delete(monitor_id: int):
+        m = get_monitor(monitor_id)
+        db.execute("DELETE FROM monitors WHERE id = ?", (monitor_id,))
+        log.info("Status check %s removed", m["name"])
+        flash(f"{m['name']} and its history were removed.")
+        return redirect(url_for("status_page"))
+
     @app.get("/report")
     def report_page():
         return render_template(
@@ -2776,7 +3742,8 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         return render_template(
             "settings.html", agents=agents, s={k: monitor.setting(k) for k in (
                 "scan_interval_minutes", "agent_offline_minutes", "growth_window_days",
-                "report_enabled", "report_weekday", "report_time")},
+                "report_enabled", "report_weekday", "report_time", "fs_warn_percent",
+                "fs_crit_percent")},
             thresholds=monitor.thresholds_for(None), kinds=KINDS, counters=COUNTERS,
             growth_choices=GROWTH_CHOICES, channels=monitor.notifier.channels(),
             weekdays=WEEKDAYS, tz_name=str(tz), rules=monitor.notify_rules(),
@@ -2801,6 +3768,11 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         db.set_setting("scan_interval_minutes", form_int("scan_interval_minutes", 5, 1440))
         db.set_setting("agent_offline_minutes", form_int("agent_offline_minutes", 3, 1440))
         db.set_setting("growth_window_days", form_int("growth_window_days", 1, 90))
+        fs_warn, fs_crit = form_int("fs_warn_percent", 50, 99), form_int("fs_crit_percent", 51, 100)
+        if fs_warn >= fs_crit:
+            abort(400, "\"Filling up\" must be below \"almost full\"")
+        db.set_setting("fs_warn_percent", fs_warn)
+        db.set_setting("fs_crit_percent", fs_crit)
         monitor.reevaluate_all()
         flash("Settings saved.")
         return redirect(url_for("settings") + "#checks")

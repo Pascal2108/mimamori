@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% from "_macros.html" import monitor_badge, beats_bar, percent, alert_item, chart %}
+{% block title %}{{ m.name }}{% endblock %}
+{% block content %}
+<a class="back" href="{{ url_for('status_page') }}">← All checks</a>
+<div>{{ monitor_badge(m) }}</div>
+<div class="drive-head">
+  <div>
+    <h1>{{ m.name }}</h1>
+    <div class="quiet small"><span class="mono">{{ m.display }}</span> · {{ m.kind_label }} · every {{ m.interval_label }}{% if m.muted %} · alerts muted{% endif %}</div>
+  </div>
+  <div class="actions">
+    <form class="inline" method="post" action="{{ url_for('monitor_check', monitor_id=m.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn" type="submit" {{ 'disabled' if m.paused }}>Check now</button>
+    </form>
+    <a class="btn" href="{{ url_for('monitor_edit', monitor_id=m.id) }}">Edit</a>
+    <form class="inline" method="post" action="{{ url_for('monitor_pause', monitor_id=m.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn" type="submit">{{ 'Resume' if m.paused else 'Pause' }}</button>
+    </form>
+    <form class="inline" method="post" action="{{ url_for('monitor_mute', monitor_id=m.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn" type="submit">{{ 'Unmute alerts' if m.muted else 'Mute alerts' }}</button>
+    </form>
+  </div>
+</div>
+
+{% if m.state == 'down' %}
+<div class="callout"><span class="dot crit"></span><div><b>Down{% if m.last_change %} since {{ m.last_change|time }}{% endif %}</b><p>{{ m.last_error or 'No answer' }}</p></div></div>
+{% elif m.state == 'up' and m.fail_count %}
+<div class="callout watch"><span class="dot warn"></span><div><b>The last check failed</b><p>{{ m.last_error }}. It counts as down after {{ m.failures }} failed checks in a row.</p></div></div>
+{% elif m.tls_level %}
+<div class="callout watch"><span class="dot warn"></span><div><b>The certificate expires in {{ m.tls_days }} day{{ 's' if m.tls_days != 1 }}</b><p>Valid until {{ m.tls_expires|time }}. Renew it before then, or visitors get a warning.</p></div></div>
+{% endif %}
+
+<div class="tiles four">
+  <div class="tile"><div class="label">Status</div><div class="value {{ {'up': 'ok', 'down': 'crit'}.get(m.state, '') }}">{{ m.state|capitalize }}</div><div class="sub">{% if m.last_change %}since {{ m.last_change|time }}{% elif m.state == 'pending' %}waiting for the first result{% else %}–{% endif %}</div></div>
+  <div class="tile"><div class="label">Response</div><div class="value">{{ m.last_ms ~ ' ms' if m.last_ms is not none else '–' }}</div><div class="sub">{% if m.last_code %}HTTP {{ m.last_code }} · {% endif %}checked {{ m.last_check|ago }}</div></div>
+  <div class="tile"><div class="label">Uptime</div><div class="value {{ 'ok' if uptime.get(30) == 1 }}">{{ percent(uptime.get(30)) }}</div><div class="sub">30 days · 24 h {{ percent(uptime.get(1)) }} · 7 days {{ percent(uptime.get(7)) }} · 90 days {{ percent(uptime.get(90)) }}</div></div>
+  <div class="tile"><div class="label">Certificate</div>
+    {% if m.tls_days is not none %}<div class="value {{ 'warn' if m.tls_level }}">{{ m.tls_days }} days</div><div class="sub">valid until {{ m.tls_expires|time }} · warns {{ m.tls_warn_days }} days before</div>
+    {% else %}<div class="value">–</div><div class="sub">{% if m.kind == 'ping' or (m.kind == 'http' and not m.target.startswith('https:')) %}no TLS for this check{% elif not m.check_tls %}not verified (turned off){% else %}not checked yet{% endif %}</div>{% endif %}</div>
+</div>
+
+<nav class="pills" aria-label="Time range">
+  {% for key, days in ranges.items() %}
+  <a href="?range={{ key }}" class="{{ 'active' if days == range_days }}">{{ '24 hours' if days == 1 else days ~ ' days' }}</a>
+  {% endfor %}
+</nav>
+
+<div class="grid-detail">
+  <div>
+    <div class="panel">
+      <div class="panel-head"><h2>Availability</h2><span class="quiet small">{{ stats.checks }} checks · {{ stats.failed }} failed</span></div>
+      <svg class="strip" viewBox="0 0 360 20" preserveAspectRatio="none" role="img" aria-label="Availability over the range">
+        {% for b in strip %}<rect class="{{ b.cls }}" x="{{ b.x }}" width="3" height="20"><title>{{ b.title }}</title></rect>{% endfor %}
+      </svg>
+      <div class="legend strip-legend"><span><i class="ok"></i>up</span><span><i class="part"></i>partly down</span><span><i class="fail"></i>down</span><span><i class="none"></i>no checks</span></div>
+    </div>
+    <div class="panel chart">
+      <div class="panel-head"><h2>Response time</h2><span class="legend"><span><i></i>ms</span>{% if stats.avg is not none %}<span>average {{ stats.avg }} ms · slowest {{ stats.max }} ms</span>{% endif %}</span></div>
+      {{ chart(rt_chart, 'Response time over time') }}
+    </div>
+  </div>
+  <aside>
+    <div class="panel">
+      <h2>Last checks</h2>
+      {{ beats_bar(beats) }}
+      <dl class="facts">
+        <dt>Check</dt><dd>{{ m.kind_label }}{% if m.kind == 'http' %}, expects {{ m.expect }}{% endif %}</dd>
+        {% if m.kind != 'ping' %}<dt>TLS</dt><dd>{% if m.kind == 'http' and not m.target.startswith('https:') %}none (http://){% elif m.check_tls %}{{ 'handshake, ' if m.kind == 'tcp' }}certificate verified{% else %}{{ 'not used' if m.kind == 'tcp' else 'certificate not verified' }}{% endif %}</dd>{% endif %}
+        <dt>Timeout</dt><dd>{{ m.timeout }} s</dd>
+        <dt>Down after</dt><dd>{{ m.failures }} failed check{{ 's' if m.failures != 1 }} in a row</dd>
+        <dt>Added</dt><dd>{{ m.created|time }}</dd>
+      </dl>
+    </div>
+    <div class="panel">
+      <h2>Alerts</h2>
+      <ul class="alert-list">
+        {% for a in alerts %}{{ alert_item(a, false) }}{% else %}<li class="empty">No alerts yet.</li>{% endfor %}
+      </ul>
+    </div>
+    <div class="panel">
+      <details class="confirm">
+        <summary class="btn small danger">Remove…</summary>
+        <form class="confirm-box" method="post" action="{{ url_for('monitor_delete', monitor_id=m.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="btn small danger" type="submit">Remove this check and its history</button>
+        </form>
+      </details>
+    </div>
+  </aside>
+</div>
+{% endblock %}

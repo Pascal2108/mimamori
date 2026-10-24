@@ -65,7 +65,7 @@ With `WEBHOOK_URL` set, mimamori sends every alert as a JSON `POST`:
  "url": "https://mimamori.example.com/drive/3", "ts": 1792270094}
 ```
 
-`kind` is one of `new_issue`, `worsened`, `resolved`, `missing`, `back`, `agent_offline`, `agent_online`, `updates`, `firmware`, `report` and `test`; `level` is `crit`, `warn`, `info` or `ok`. Alerts also carry `severity` (`low`, `middle`, `high`, or empty; the page shows them as low, medium and critical) and `topics`, the rule names from Settings → Notifications (e.g. `["drive_high"]`, `["updates_middle"]`). Only alerts whose topic you allowed for the webhook are sent to it.
+`kind` is one of `new_issue`, `worsened`, `resolved`, `missing`, `back`, `agent_offline`, `agent_online`, `updates`, `firmware`, `storage`, `monitor_down`, `monitor_up`, `monitor_tls`, `report` and `test`; `level` is `crit`, `warn`, `info` or `ok`. Alerts also carry `severity` (`low`, `middle`, `high`, or empty; the page shows them as low, medium and critical) and `topics`, the rule names from Settings → Notifications (e.g. `["drive_high"]`, `["updates_middle"]`). Only alerts whose topic you allowed for the webhook are sent to it. Alerts of the status monitor have an empty `host` and `drive: null`, and carry `"monitor": {"name": "…", "kind": "http", "target": "https://…"}` instead (the target without its query string, which may hold a token).
 
 With `WEBHOOK_SECRET` set, every request carries the headers `X-Mimamori-Timestamp` and `X-Mimamori-Signature: sha256=<hex>`, the HMAC-SHA256 of `<timestamp>.<raw body>` with the secret as key. Check the signature with a constant-time comparison and reject timestamps older than a few minutes.
 

@@ -23,11 +23,17 @@ services:
     # (optional) Missing security updates of this host: mount its OS and package list
     # read-only, and the server checks them against the OSV vulnerability database.
     # Debian, Ubuntu, Proxmox: remove the # in front of the first three lines.
-    # Alpine: remove it in front of the first two lines and the last one.
+    # Alpine: remove it in front of the first two lines and the third.
+    # (optional) How full the host's filesystems are: create an empty folder on each one
+    # (e.g. mkdir /srv/mimamori-fs /mnt/data/.mimamori-fs) and mount it read-only under
+    # /host/fs/<name>, as in the last two lines. The agent only asks how full the filesystem
+    # under the folder is; it cannot see a single file of the host this way.
     # volumes:
     #   - /etc/os-release:/host/etc/os-release:ro
     #   - /var/lib/dpkg:/host/var/lib/dpkg:ro
     #   - /lib/apk/db:/host/lib/apk/db:ro
+    #   - /srv/mimamori-fs:/host/fs/root:ro
+    #   - /mnt/data/.mimamori-fs:/host/fs/data:ro
     # (optional) Keep AGENT_KEY out of the environment, where "docker inspect" shows it: put
     # the key alone into a file agent_key next to this one (chmod 600 agent_key), remove it
     # from agent.env, and remove the # in front of AGENT_KEY_FILE above, these two lines and

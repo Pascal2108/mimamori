@@ -12,7 +12,7 @@
 {%- endmacro %}
 
 {% macro alert_kind(a) -%}
-<span class="alert-kind {{ alert_tone(a) }}">{{ {'new_issue': 'New issue', 'worsened': 'Worsened', 'resolved': 'Resolved', 'missing': 'Missing', 'back': 'Back', 'agent_offline': 'Agent offline', 'agent_online': 'Agent online', 'updates': 'Security update', 'firmware': 'Firmware'}.get(a.kind, a.kind) }}</span>
+<span class="alert-kind {{ alert_tone(a) }}">{{ {'new_issue': 'New issue', 'worsened': 'Worsened', 'resolved': 'Resolved', 'missing': 'Missing', 'back': 'Back', 'agent_offline': 'Agent offline', 'agent_online': 'Agent online', 'updates': 'Security update', 'firmware': 'Firmware', 'storage': 'Disk space', 'monitor_down': 'Down', 'monitor_up': 'Up', 'monitor_tls': 'Certificate'}.get(a.kind, a.kind) }}</span>
 {%- endmacro %}
 
 {% macro alert_dot(a) -%}
@@ -51,4 +51,51 @@
   <text class="axis" x="{{ c.w / 2 }}" y="{{ c.h / 2 }}" text-anchor="middle">no data in this range</text>
   {% endif %}
 </svg>
+{%- endmacro %}
+
+{# Used space as a bar: an SVG, since the CSP allows no inline styles #}
+{% macro usage_bar(f) -%}
+<svg class="usage-bar {{ f.level or 'ok' }}" viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true"><rect class="track" width="100" height="6"></rect><rect class="fill" width="{{ [f.percent, 1]|max }}" height="6"></rect></svg>
+{%- endmacro %}
+
+{% macro usage(f) -%}
+<div class="usage" title="{{ f.name }}: {{ f.used|bytes }} of {{ f.total|bytes }} used">
+  <div class="usage-text"><span class="mono">{{ f.name }}</span><span><span class="{{ f.level }}">{{ f.percent }} %</span> · {{ f.free|bytes }} free</span></div>
+  {{ usage_bar(f) }}
+</div>
+{%- endmacro %}
+
+{% macro fs_table(filesystems, show_drive=true) -%}
+<div class="table-wrap">
+<table class="fs-table">
+  <thead><tr><th>Filesystem</th>{% if show_drive %}<th>On drive</th>{% endif %}<th>Used</th><th class="num">Used of size</th><th class="num">Free</th><th>Last 30 days</th></tr></thead>
+  <tbody>
+  {% for f in filesystems %}
+  <tr>
+    <td><span class="mono">{{ f.name }}</span><div class="quiet small">{{ f.fstype or '?' }}{% if f.source %} · <span class="mono">{{ f.source }}</span>{% endif %}</div></td>
+    {% if show_drive %}<td>{% for d in f.drives %}<a href="{{ url_for('drive', drive_id=d.id) }}">{{ d.model or 'Unknown drive' }}</a> <span class="mono quiet">{{ d.device }}</span>{{ '<br>'|safe if not loop.last }}{% else %}<span class="quiet">{% if f.disks %}<span class="mono">{{ f.disks|join(', ') }}</span> (not watched){% else %}not one drive (ZFS, network){% endif %}</span>{% endfor %}</td>{% endif %}
+    <td class="usage-cell"><span class="{{ f.level }}">{{ f.percent }} %</span>{{ usage_bar(f) }}</td>
+    <td class="num">{{ f.used|bytes }} of {{ f.total|bytes }}</td>
+    <td class="num {{ f.level }}">{{ f.free|bytes }}</td>
+    <td>{% if f.spark %}<svg class="spark fs {{ f.level or 'ok' }}" viewBox="0 0 180 28" preserveAspectRatio="none" aria-hidden="true"><polyline points="{{ f.spark }}"></polyline></svg>{% endif %}
+      <div class="quiet small">{% if not f.trend %}trend after two days{% elif f.trend.per_week > 0 %}+{{ f.trend.per_week|bytes }} a week{% if f.trend.full_in_days is not none and f.trend.full_in_days < 730 %} · <span class="{{ 'warn' if f.trend.full_in_days < 30 }}">full in {% if f.trend.full_in_days < 60 %}about {{ f.trend.full_in_days }} days{% else %}about {{ f.trend.full_in_days // 30 }} months{% endif %}</span>{% endif %}{% elif f.trend.per_week < 0 %}−{{ (0 - f.trend.per_week)|bytes }} a week{% else %}no change{% endif %}</div></td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{%- endmacro %}
+
+{# Status monitor #}
+{% macro monitor_badge(m) -%}
+{%- set cls = {'up': 'healthy', 'down': 'failing'}.get(m.state, '') -%}
+<span class="badge {{ cls }}"><span class="dot {{ cls or 'missing' }}"></span>{{ m.state }}</span>
+{%- endmacro %}
+
+{% macro beats_bar(beats) -%}
+<svg class="beats" viewBox="0 0 160 16" preserveAspectRatio="none" role="img" aria-label="The last checks">{% for b in beats %}<rect class="{{ b.cls }}" x="{{ b.x }}" width="3" height="16"><title>{{ b.title }}</title></rect>{% else %}<rect class="none" width="160" height="16"></rect>{% endfor %}</svg>
+{%- endmacro %}
+
+{% macro percent(share) -%}
+{%- if share is none %}–{% elif share >= 1 %}100 %{% elif share <= 0 %}0 %{% else %}{{ '%.2f'|format([share * 100, 99.99]|min) }} %{% endif -%}
 {%- endmacro %}

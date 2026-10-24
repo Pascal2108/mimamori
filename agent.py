@@ -1,5 +1,5 @@
 """mimamori agent: reads the SMART data of this host's drives (and, if mounted, the host's
-installed packages) and reports it to the server.
+installed packages and how full its filesystems are) and reports it to the server.
 
     python agent.py          run the agent
     python agent.py health   container health check
@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import socket
 import ssl
@@ -419,6 +420,96 @@ def read_host() -> dict | None:
 
 
 # ============================================================================
+# Used space of the host's filesystems (optional)
+#
+# Each folder under /host/fs is a read-only bind mount of a folder on one of the host's
+# filesystems; an empty one is enough. Asking the kernel how full the filesystem under it is
+# (statvfs) needs no rights at all, so the unprivileged reporter does it, and the container
+# can read no file of the host this way. Which disks hold the filesystem comes from
+# /proc/self/mountinfo and /sys/class/block, both readable in every container. The agent
+# sends the raw names; the server matches them to the drives.
+# ============================================================================
+
+FS_ROOT = Path(os.environ.get("FS_ROOT", "/host/fs"))
+FS_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+MAX_FILESYSTEMS = 32
+SYS_BLOCK = Path("/sys/class/block")
+SYS_DEV_BLOCK = Path("/sys/dev/block")
+MOUNTINFO = Path("/proc/self/mountinfo")
+
+
+def _unescape(field: str) -> str:
+    """mountinfo writes spaces, tabs and backslashes as octal escapes (\\040, \\134)."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def _mountinfo() -> dict[str, tuple[str, str, str]]:
+    """mount point -> (major:minor, filesystem type, source) from /proc/self/mountinfo."""
+    out: dict[str, tuple[str, str, str]] = {}
+    try:
+        with open(MOUNTINFO, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                left, sep, right = line.partition(" - ")
+                a, b = left.split(), right.split()
+                if sep and len(a) >= 5 and len(b) >= 2:
+                    out[_unescape(a[4])] = (a[2], _unescape(b[0]), _unescape(b[1]))
+    except OSError:
+        pass
+    return out
+
+
+def _disks_of(block: str, depth: int = 0) -> list[str]:
+    """The whole disks under a block device: sda1 -> sda, dm-0 (LVM, LUKS) and md0 (RAID) ->
+    the disks below them."""
+    node = SYS_BLOCK / block
+    if depth > 4 or not re.match(r"^[\w.-]{1,64}$", block) or not node.exists():
+        return []
+    if (node / "partition").exists():
+        return [node.resolve().parent.name]
+    try:
+        below = sorted(p.name for p in (node / "slaves").iterdir())
+    except OSError:
+        below = []
+    if not below:
+        return [block]
+    return sorted({d for b in below[:16] for d in _disks_of(b, depth + 1)})
+
+
+def read_filesystems() -> list[dict] | None:
+    """Size and used space of each filesystem mounted under /host/fs, or None when there is
+    no such folder (then nothing is sent, and the server keeps what it had)."""
+    try:
+        names = sorted(p.name for p in FS_ROOT.iterdir() if FS_NAME.match(p.name))
+    except OSError:
+        return None
+    mounts = _mountinfo()
+    out = []
+    for name in names[:MAX_FILESYSTEMS]:
+        path = FS_ROOT / name
+        try:
+            usage = shutil.disk_usage(path)
+            st_dev = os.stat(path).st_dev
+        except OSError as exc:
+            log.warning("Cannot read the used space of %s: %s", path,
+                        exc.strerror or type(exc).__name__)
+            continue
+        majmin, fstype, source = mounts.get(str(path), ("", "", ""))
+        if not majmin and hasattr(os, "major"):
+            majmin = f"{os.major(st_dev)}:{os.minor(st_dev)}"
+        block = ""
+        try:  # /sys/dev/block/8:1 -> .../block/sda/sda1
+            block = (SYS_DEV_BLOCK / majmin).resolve(strict=True).name if majmin else ""
+        except OSError:
+            # btrfs and ZFS use a device number without a block device: try the source
+            if source.startswith("/dev/"):
+                block = source.rsplit("/", 1)[1]
+        out.append({"name": name, "fstype": fstype[:32], "source": source[:200],
+                    "block": block[:64], "disks": _disks_of(block) if block else [],
+                    "total": usage.total, "used": usage.used, "free": usage.free})
+    return out
+
+
+# ============================================================================
 # Privilege separation
 #
 # Reading raw drives needs root and the capabilities SYS_RAWIO / SYS_ADMIN. Talking to the
@@ -637,6 +728,9 @@ def run() -> int:
                 host = read_host()  # in the unprivileged reporter: the files are world-readable
                 if host:
                     payload["host"] = host
+                filesystems = read_filesystems()  # needs no privileges either
+                if filesystems is not None:
+                    payload["filesystems"] = filesystems
                 result = client.post("report", payload)
                 log.info("Reported %d device(s), the server tracks %s drive(s)", len(devices),
                          result.get("drives"))

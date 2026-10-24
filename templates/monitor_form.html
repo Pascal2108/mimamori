@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Edit ' ~ m.name if m.id else 'Add a check' }}{% endblock %}
+{% block content %}
+<a class="back" href="{{ url_for('monitor_page', monitor_id=m.id) if m.id else url_for('status_page') }}">← {{ 'Back to ' ~ m.name if m.id else 'All checks' }}</a>
+<h1 class="headline">{{ 'Edit ' ~ m.name if m.id else 'Add a check' }}</h1>
+
+<div class="panel form-panel">
+  {# The fields that do not fit the chosen kind are hidden by the stylesheet (:has), no script #}
+  <form class="monitor-form" method="post" action="{{ url_for('monitor_save', monitor_id=m.id) if m.id else url_for('monitor_create') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="field">
+      <label>What to check</label>
+      <div class="kind-pick">
+        {% for key, label in kinds.items() %}
+        <label class="check"><input type="radio" id="k-{{ key }}" name="kind" value="{{ key }}" {{ 'checked' if m.kind == key }}> {{ label }}</label>
+        {% endfor %}
+      </div>
+      <p class="quiet small hint only-http">Requests the URL and checks the HTTP status code; over https:// it can verify the certificate as well.</p>
+      <p class="quiet small hint only-tcp">Opens a connection to the port, for databases, mail, SSH or game servers. It can do a TLS handshake and verify the certificate as well.</p>
+      <p class="quiet small hint only-ping">Sends one ICMP echo request. Some hosts and firewalls do not answer pings.</p>
+    </div>
+    <div class="row">
+      <div class="field"><label for="m-name">Name</label><input id="m-name" name="name" value="{{ m.name }}" maxlength="48" placeholder="Nextcloud" required></div>
+      <div class="field wide"><label for="m-target"><span class="only-http">URL</span><span class="only-host">Host name or IP address</span></label><input id="m-target" name="target" value="{{ m.target }}" maxlength="2048" placeholder="https://cloud.example.com/ or nas.home" required autocomplete="off" spellcheck="false"></div>
+      <div class="field only-tcp narrow"><label for="m-port">Port</label><input id="m-port" name="port" type="number" min="1" max="65535" value="{{ m.port or '' }}" placeholder="443"></div>
+    </div>
+    <div class="row">
+      <div class="field only-http"><label for="m-expect">Status codes that count as up</label><input id="m-expect" name="expect" value="{{ m.expect }}" maxlength="100" placeholder="200-399"></div>
+      <div class="field"><label for="m-interval">Check every</label><select id="m-interval" name="interval">{% for s, label in intervals.items() %}<option value="{{ s }}" {{ 'selected' if s == m.interval }}>{{ label }}</option>{% endfor %}</select></div>
+      <div class="field"><label for="m-timeout">Timeout (seconds)</label><input id="m-timeout" name="timeout" type="number" min="1" max="30" value="{{ m.timeout }}" required></div>
+      <div class="field"><label for="m-failures">Down after (failed checks in a row)</label><input id="m-failures" name="failures" type="number" min="1" max="10" value="{{ m.failures }}" required></div>
+    </div>
+    <div class="row only-tls">
+      <div class="field wide"><label class="check"><input type="checkbox" name="check_tls" value="1" {{ 'checked' if m.check_tls }}> <span class="only-http">Verify the certificate (https:// only). Turn it off for a self-signed certificate.</span><span class="only-tcp">TLS: do a handshake and verify the certificate</span></label></div>
+      <div class="field"><label for="m-tlsdays">Warn this many days before it expires</label><input id="m-tlsdays" name="tls_warn_days" type="number" min="1" max="90" value="{{ m.tls_warn_days }}" required></div>
+    </div>
+    <p class="quiet small">The server checks from its own network. Redirects are not followed, and a URL must not contain a user name or password. Who gets told when it goes down is set in <a href="{{ url_for('settings') }}#notifications">Settings → Notifications</a>.</p>
+    <button class="btn primary" type="submit">{{ 'Save' if m.id else 'Add and check now' }}</button>
+  </form>
+</div>
+{% endblock %}

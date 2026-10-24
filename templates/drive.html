@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import badge, alert_item, chart %}
+{% from "_macros.html" import badge, alert_item, chart, fs_table %}
 {% block title %}{{ d.model or 'Drive' }}{% endblock %}
 {% macro tile(label, value, sub, cls='') -%}
 <div class="tile"><div class="label">{{ label }}</div><div class="value {{ cls }}">{{ value }}</div><div class="sub">{{ sub }}</div></div>
@@ -82,6 +82,16 @@
   {{ tile('CRC errors', latest.crc_errors|num, 'cable looks fine' if not latest.crc_errors else 'check the cable', lvl('crc_errors')) }}
   {% endif %}
 </div>
+
+{% if d.fs %}
+<section class="section" id="storage">
+  <h2>Disk space</h2>
+  <div class="panel">
+    {{ fs_table(d.fs, false) }}
+    {% if d.fs|selectattr('drives')|map(attribute='drives')|map('length')|max > 1 %}<p class="quiet small">A filesystem that spans several drives (RAID, LVM) shows on each of them.</p>{% endif %}
+  </div>
+</section>
+{% endif %}
 
 <nav class="pills" aria-label="Time range">
   {% for key, days in ranges.items() %}

@@ -47,6 +47,22 @@
       </ul>
     </div>
     {% endif %}
+    {% if r.storage %}
+    <div class="panel">
+      <h2>Disk space</h2>
+      <ul class="plain-list">
+        {% for u in r.storage %}<li>{{ u }}</li>{% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+    {% if r.monitors %}
+    <div class="panel">
+      <h2>Status monitor</h2>
+      <ul class="plain-list">
+        {% for u in r.monitors %}<li>{{ u }}</li>{% endfor %}
+      </ul>
+    </div>
+    {% endif %}
     <div class="panel">
       <h2>Delivery</h2>
       <p class="quiet small">
