@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% from "_macros.html" import alert_item, push_badge %}
+{% block title %}{{ hb.name }}{% endblock %}
+{% block content %}
+<a class="back" href="{{ url_for('status_page') }}">← Status</a>
+<div>{{ push_badge(hb) }}</div>
+<div class="drive-head">
+  <div>
+    <h1>{{ hb.name }}</h1>
+    <div class="quiet small">Push check · runs every {{ hb.interval_label }}, may be late by {{ hb.grace_label }}{% if hb.muted %} · alerts muted{% endif %}</div>
+  </div>
+  <div class="actions">
+    <a class="btn" href="{{ url_for('push_edit', heartbeat_id=hb.id) }}">Edit</a>
+    <form class="inline" method="post" action="{{ url_for('push_pause', heartbeat_id=hb.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn" type="submit">{{ 'Resume' if hb.paused else 'Pause' }}</button>
+    </form>
+    <form class="inline" method="post" action="{{ url_for('push_mute', heartbeat_id=hb.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn" type="submit">{{ 'Unmute alerts' if hb.muted else 'Mute alerts' }}</button>
+    </form>
+  </div>
+</div>
+
+{% if hb.state == 'failed' %}
+<div class="callout"><span class="dot crit"></span><div><b>The last run failed{% if hb.last_change %} ({{ hb.last_change|time }}){% endif %}</b><p>{{ hb.last_message or 'It reported a failure without a message.' }}</p></div></div>
+{% elif hb.state == 'late' %}
+<div class="callout"><span class="dot crit"></span><div><b>Overdue since {{ hb.deadline|time }}</b><p>{% if hb.last_success %}The last success was {{ hb.last_success|time }}.{% else %}It has not reported a success yet.{% endif %} Check that the job runs and can reach mimamori.</p></div></div>
+{% elif hb.state == 'new' %}
+<div class="callout missing"><span class="dot missing"></span><div><b>Waiting for the first run</b><p>It counts as overdue if no success comes by {{ hb.deadline|time }}.</p></div></div>
+{% endif %}
+
+<div class="tiles four">
+  <div class="tile"><div class="label">Status</div><div class="value {{ {'up': 'ok', 'failed': 'crit', 'late': 'crit'}.get(hb.state, '') }}">{{ {'up': 'OK', 'failed': 'Failed', 'late': 'Overdue', 'new': 'New', 'paused': 'Paused'}[hb.state] }}</div><div class="sub">{% if hb.last_change %}since {{ hb.last_change|time }}{% else %}–{% endif %}</div></div>
+  <div class="tile"><div class="label">Last success</div><div class="value">{{ hb.last_success|ago if hb.last_success else '–' }}</div><div class="sub">{{ hb.last_success|time if hb.last_success else 'none yet' }}</div></div>
+  <div class="tile"><div class="label">Overdue at</div><div class="value">{{ hb.deadline|time(false) if not hb.paused else '–' }}</div><div class="sub">{{ hb.deadline|time if not hb.paused else 'paused' }}</div></div>
+  <div class="tile"><div class="label">Running</div><div class="value">{{ hb.running|ago if hb.running else '–' }}</div><div class="sub">{{ 'started, not ended yet' if hb.running else 'no run in progress' }}</div></div>
+</div>
+
+<div class="grid-detail">
+  <div class="panel">
+    <h2>Last pings</h2>
+    {% if pings %}
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>When</th><th>What</th><th>Message</th></tr></thead>
+      <tbody>
+      {% for p in pings %}
+      <tr><td class="nowrap small">{{ p.ts|time }}</td><td><span class="{{ {'success': 'ok', 'fail': 'crit'}.get(p.kind, 'quiet') }}">{{ p.kind }}</span></td><td class="small push-message">{{ p.message }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    {% else %}
+    <p class="empty">No ping yet. Set up the job with its URL; if you no longer have it, make a new one below.</p>
+    {% endif %}
+  </div>
+  <aside>
+    <div class="panel">
+      <h2>Alerts</h2>
+      <ul class="alert-list">
+        {% for a in alerts %}{{ alert_item(a, false) }}{% else %}<li class="empty">No alerts yet.</li>{% endfor %}
+      </ul>
+    </div>
+    <div class="panel">
+      <p class="quiet small">The URL is shown only once. A new one replaces it at once; update the job afterwards.</p>
+      <details class="confirm">
+        <summary class="btn small">New URL…</summary>
+        <form class="confirm-box" method="post" action="{{ url_for('push_new_url', heartbeat_id=hb.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="btn small danger" type="submit">Make a new URL, the old one stops working</button>
+        </form>
+      </details>
+      <details class="confirm">
+        <summary class="btn small danger">Remove…</summary>
+        <form class="confirm-box" method="post" action="{{ url_for('push_delete', heartbeat_id=hb.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="btn small danger" type="submit">Remove this check and its history</button>
+        </form>
+      </details>
+    </div>
+  </aside>
+</div>
+{% endblock %}

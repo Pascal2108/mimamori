@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}URL for {{ hb.name }}{% endblock %}
+{% block content %}
+<a class="back" href="{{ url_for('push_page', heartbeat_id=hb.id) }}">← {{ hb.name }}</a>
+<h1 class="headline">The URL for “{{ hb.name }}”</h1>
+<div class="banner unsafe-hint" role="alert"><strong>Copy the URL now.</strong> It is shown only once: mimamori keeps only a hash of it. Anyone with it can report runs of this job, so keep it out of git, issues and screenshots. If it leaks, make a new one on the check's page; the old one stops working at once.</div>
+
+<div class="panel">
+  <h2>The URL</h2>
+<pre class="code">{{ url }}</pre>
+  <p class="quiet small">POST to it when the job succeeded. Append <span class="mono">/start</span> when it begins, <span class="mono">/fail</span> when it failed, <span class="mono">/log</span> for a note, or the exit code (<span class="mono">/0</span> is success, anything else a failure). The text in the body (up to 1,000 characters) shows up on the page and in the alert.</p>
+</div>
+
+<div class="panel">
+  <h2>Backrest</h2>
+  <p class="quiet small">In the plan (or the repository), add a hook of the type <b>Healthchecks</b> with this URL as its webhook URL, and choose the conditions <span class="mono">CONDITION_SNAPSHOT_START</span>, <span class="mono">CONDITION_SNAPSHOT_SUCCESS</span> and <span class="mono">CONDITION_SNAPSHOT_ERROR</span> (or <span class="mono">CONDITION_ANY_ERROR</span>). Backrest then calls the URL itself, <span class="mono">/start</span> at the start and <span class="mono">/fail</span> on an error, with its summary as the text. The Backrest container must reach the HTTPS address of mimamori.</p>
+</div>
+
+<div class="panel">
+  <h2>A script or cron job</h2>
+<pre class="code"># at the end of the job: success or failure by its exit code
+your-backup-command
+curl -fsS -m 10 --retry 3 -X POST --data-raw "exit $?" {{ url }}/$?</pre>
+  <p class="quiet small">Works with anything that can send an HTTPS request, in the same way as healthchecks.io.</p>
+</div>
+<p><a class="btn primary" href="{{ url_for('push_page', heartbeat_id=hb.id) }}">Done</a></p>
+{% endblock %}

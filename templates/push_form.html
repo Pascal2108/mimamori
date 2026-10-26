@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Edit ' ~ hb.name if hb.id else 'Add a backup or job' }}{% endblock %}
+{% block content %}
+<a class="back" href="{{ url_for('push_page', heartbeat_id=hb.id) if hb.id else url_for('status_page') }}">← {{ 'Back to ' ~ hb.name if hb.id else 'Status' }}</a>
+<h1 class="headline">{{ 'Edit ' ~ hb.name if hb.id else 'Add a backup or job' }}</h1>
+
+<div class="panel form-panel">
+  <form method="post" action="{{ url_for('push_save', heartbeat_id=hb.id) if hb.id else url_for('push_create') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p class="quiet small">The job calls a secret URL of mimamori when it ran, e.g. the Healthchecks hook of Backrest or a <span class="mono">curl</span> at the end of a script. mimamori tells you when it reports a failure, and when no success comes in time, which also catches a job that did not run at all.</p>
+    <div class="row">
+      <div class="field wide"><label for="p-name">Name</label><input id="p-name" name="name" value="{{ hb.name }}" maxlength="48" placeholder="Backrest: nas to b2" required></div>
+      <div class="field"><label for="p-interval">It runs every</label><select id="p-interval" name="interval">{% for s, label in intervals.items() %}<option value="{{ s }}" {{ 'selected' if s == hb.interval }}>{{ label }}</option>{% endfor %}</select></div>
+      <div class="field"><label for="p-grace">It may be late by (minutes)</label><input id="p-grace" name="grace_minutes" type="number" min="5" max="2880" value="{{ (hb.grace // 60) if hb.grace else 120 }}" required></div>
+    </div>
+    <p class="quiet small">Overdue means: no success within the interval plus the time it may be late, counted from the last success. Allow for how long a run takes.</p>
+    <button class="btn primary" type="submit">{{ 'Save' if hb.id else 'Add and show the URL' }}</button>
+  </form>
+</div>
+{% endblock %}

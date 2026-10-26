@@ -5,7 +5,10 @@
   <title>{% block title %}mimamori{% endblock %} · mimamori</title>
 </head>
 <body>
-{% set nav = [('overview', 'Overview'), ('status_page', 'Status'), ('alerts', 'Alerts'), ('report_page', 'Weekly report'), ('settings', 'Settings')] %}
+{% set nav = [('overview', 'Overview'), ('drives_page', 'Drives'), ('systems_page', 'Systems'), ('docker_page', 'Docker'), ('status_page', 'Status'), ('alerts', 'Alerts')] %}
+{# Which tab a page belongs to: its own endpoint, or one of these #}
+{% set sections = {'drives_page': ('drive',), 'systems_page': ('host',), 'docker_page': ('image_',), 'status_page': ('monitor_', 'push_'), 'alerts': ('report_page',)} %}
+{% set ep = request.endpoint or '' %}
 {% if logged_in %}
 <header class="top">
   <div class="top-inner">
@@ -15,20 +18,14 @@
     </a>
     <nav class="nav" aria-label="Main">
       {% for endpoint, label in nav %}
-      <a href="{{ url_for(endpoint) }}" class="{{ 'active' if request.endpoint == endpoint or (endpoint == 'overview' and request.endpoint in ('drive', 'host')) or (endpoint == 'status_page' and request.endpoint and request.endpoint.startswith('monitor_')) }}">{{ label }}</a>
+      <a href="{{ url_for(endpoint) }}" class="{{ 'active' if ep == endpoint or ep.startswith(sections.get(endpoint, ('#',))) }}">{{ label }}</a>
       {% endfor %}
     </nav>
     <div class="top-right">
-      <span class="quiet">{% if last_check %}Checked {{ last_check|time(false) }} · next {{ next_check|time(false) }}{% else %}No checks yet{% endif %}</span>
-      <form class="inline" method="post" action="{{ url_for('check_now') }}">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <input type="hidden" name="back" value="{{ request.path }}">
-        <button class="btn" type="submit">Check now</button>
-      </form>
-      <form class="inline" method="post" action="{{ url_for('notify_test') }}">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button class="btn primary" type="submit">Send test notification</button>
-      </form>
+      {# A gear instead of the word; inline SVG, so the CSP needs no change #}
+      <a class="icon-btn {{ 'active' if ep == 'settings' }}" href="{{ url_for('settings') }}" aria-label="Settings" title="Settings">
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
+      </a>
       <form class="inline" method="post" action="{{ url_for('logout') }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <button class="btn" type="submit">Log out</button>
@@ -37,18 +34,9 @@
     <details class="menu">
       <summary aria-label="Menu">☰</summary>
       <div class="menu-panel">
-        {% for endpoint, label in nav %}
-        <a href="{{ url_for(endpoint) }}" class="{{ 'active' if request.endpoint == endpoint }}">{{ label }}</a>
+        {% for endpoint, label in nav + [('settings', 'Settings')] %}
+        <a href="{{ url_for(endpoint) }}" class="{{ 'active' if ep == endpoint or ep.startswith(sections.get(endpoint, ('#',))) }}">{{ label }}</a>
         {% endfor %}
-        <form method="post" action="{{ url_for('check_now') }}">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <input type="hidden" name="back" value="{{ request.path }}">
-          <button class="btn" type="submit">Check now</button>
-        </form>
-        <form method="post" action="{{ url_for('notify_test') }}">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <button class="btn primary" type="submit">Send test notification</button>
-        </form>
         <form method="post" action="{{ url_for('logout') }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button class="btn" type="submit">Log out</button>

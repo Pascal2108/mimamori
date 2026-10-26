@@ -1,10 +1,10 @@
 {% extends "base.html" %}
-{% from "_macros.html" import badge, alert_item, usage, usage_bar %}
+{% from "_macros.html" import alert_item %}
 {% block title %}Overview{% endblock %}
 {% block content %}
 <p class="date">{{ today.strftime('%A') }}, {{ today.day }} {{ today.strftime('%B') }}</p>
 <h1 class="headline">{{ lead }}</h1>
-{# One ranking for drives and updates: critical, medium, low #}
+{# One ranking for everything: critical, medium, low #}
 {% if items %}
 <details class="attention">
   <summary><span class="dot {{ att.tone }}"></span><span class="what"><b>{{ att.total }} thing{{ 's' if att.total != 1 }}</b> need{{ 's' if att.total == 1 }} attention{% for lvl, n in att.levels.items() if n %} · {{ n }} {{ lvl|sev }}{% endfor %}{% if att.hosts %} · {{ att.hosts[:3]|join(', ') }}{% if att.hosts|length > 3 %} and {{ att.hosts|length - 3 }} more{% endif %}{% endif %}</span></summary>
@@ -14,186 +14,110 @@
     {% endfor %}
   </ul>
 </details>
-{% elif not drives %}
-<p class="attention quiet">No drives have reported yet.</p>
+{% elif not agents and not images %}
+<p class="attention quiet">Nothing reports yet. Add an agent in <a href="{{ url_for('settings') }}#agents">Settings → Agents</a>, or an image under <a href="{{ url_for('docker_page') }}">Docker</a>.</p>
+{% else %}
+<p class="attention quiet"><span class="dot ok"></span> Nothing needs attention.</p>
 {% endif %}
 
-<div class="tiles four">
-  <div class="tile"><div class="label">Drives</div><div class="value">{{ drives|length }}</div>
-    <div class="sub">on {{ agents|length }} host{{ 's' if agents|length != 1 }} · {% if offline %}<span class="crit">{{ offline }} agent{{ 's' if offline != 1 }} offline</span>{% else %}all agents online{% endif %}</div></div>
-  <div class="tile attention-tile {{ att.tone if att.total }}"><div class="label">Attention</div>
-    <div class="value {{ att.tone if att.total else 'ok' }}">{{ att.total }}</div>
-    <div class="sub">{% set k = att.kinds %}
-      <span class="{{ 'warn' if k.updates }}">{% if k.updates %}<span class="dot warn"></span> {% endif %}{{ k.updates }} security update{{ 's' if k.updates != 1 }}</span>
-      <span class="{{ 'crit' if k.drive else 'quiet' }}">{{ k.drive }} drive{{ 's' if k.drive != 1 }}</span>
-      {% if k.firmware %}<span class="warn">{{ k.firmware }} firmware</span>{% endif %}
-      {% if k.storage %}<span class="warn">{{ k.storage }} disk space</span>{% endif %}
-      {% if k.monitor %}<span class="crit">{{ k.monitor }} status check{{ 's' if k.monitor != 1 }}</span>{% endif %}
-      {% if k.agent %}<span class="crit">{{ k.agent }} agent{{ 's' if k.agent != 1 }}</span>{% endif %}
-    </div></div>
-  {% set healthy = drives|selectattr('status', 'equalto', 'healthy')|rejectattr('no_smart')|list|length %}
-  <div class="tile"><div class="label">Healthy</div><div class="value ok">{{ healthy }}<span class="of"> / {{ drives|length }}</span></div>
-    <div class="sub">{% if no_smart %}{{ no_smart|length }} {{ 'virtual disk' if no_smart|selectattr('virtual')|list|length == no_smart|length else 'drive' }}{{ 's' if no_smart|length != 1 }} without SMART data{% elif healthy == drives|length %}no open issues{% else %}{{ drives|length - healthy }} with an issue{% endif %}</div></div>
-  <div class="tile"><div class="label">Warmest</div>
-    {% if warmest %}<div class="value">{{ warmest.latest.temp }} °C</div><div class="sub">{{ warmest.device|replace('/dev/', '') }} · {{ warmest.model }}</div>
-    {% else %}<div class="value">–</div><div class="sub">no readings yet</div>{% endif %}
-  </div>
+{# Drives, systems and Docker side by side, all alike; each links to its own page #}
+<div class="pillars">
+  {# --- Drives --- #}
+  {% set bad = ds.counts.failing + ds.counts.missing %}
+  {% set tone = 'crit' if bad or ds.offline else 'warn' if ds.counts.watch or ds.firmware else 'ok' if drives else 'none' %}
+  <section class="pillar tone-{{ tone }}">
+    <a class="pillar-head" href="{{ url_for('drives_page') }}"><h2><span class="dot {{ tone if tone != 'none' else 'missing' }}"></span>Drives</h2><span class="more">All drives →</span></a>
+    <div class="pillar-value">{% if drives %}<span class="{{ 'ok' if ds.healthy == drives|length }}">{{ ds.healthy }}</span><span class="of"> / {{ drives|length }} healthy</span>{% else %}<span class="quiet">–</span>{% endif %}</div>
+    <div class="pillar-sub">{% if drives %}on {{ agents|length }} host{{ 's' if agents|length != 1 }}{% if ds.warmest %} · warmest {{ ds.warmest.latest.temp }} °C{% endif %}{% else %}no drives reported yet{% endif %}</div>
+    <div class="pillar-stats">
+      <div><span class="k">Failing</span><span class="v {{ 'crit' if ds.counts.failing }}">{{ ds.counts.failing }}</span></div>
+      <div><span class="k">Watch</span><span class="v {{ 'warn' if ds.counts.watch }}">{{ ds.counts.watch }}</span></div>
+      <div><span class="k">Missing</span><span class="v {{ 'crit' if ds.counts.missing }}">{{ ds.counts.missing }}</span></div>
+      <div><span class="k">Agents offline</span><span class="v {{ 'crit' if ds.offline }}">{{ ds.offline }}</span></div>
+    </div>
+    <ul class="pillar-list">
+      {% for i in drive_items[:5] %}
+      <li><span class="dot {{ 'crit' if i.tone == 'crit' else 'warn' if i.tone == 'warn' else 'missing' }}"></span><a href="{{ i.url }}">{{ i.text }}</a></li>
+      {% else %}
+      <li class="quiet">{% if not agents %}<a href="{{ url_for('settings') }}#agents">Add your first agent</a> to watch the drives of a host.{% elif ds.no_smart and ds.no_smart|length == drives|length %}The drives report no SMART data (virtual disks); mimamori checks that they respond.{% else %}No drive needs attention.{% endif %}</li>
+      {% endfor %}
+      {% if drive_items|length > 5 %}<li class="quiet"><a href="{{ url_for('drives_page') }}">and {{ drive_items|length - 5 }} more</a></li>{% endif %}
+    </ul>
+  </section>
+
+  {# --- Systems --- #}
+  {% set tone = 'crit' if sys.storage and agents|selectattr('fullest')|selectattr('fullest.level', 'equalto', 'crit')|list else 'warn' if sys.update_total or sys.reboot or sys.storage else 'ok' if sys.reported else 'none' %}
+  <section class="pillar tone-{{ tone }}">
+    <a class="pillar-head" href="{{ url_for('systems_page') }}"><h2><span class="dot {{ tone if tone != 'none' else 'missing' }}"></span>Systems</h2><span class="more">All systems →</span></a>
+    <div class="pillar-value">{% if sys.reported %}<span class="{{ 'warn' if sys.update_total else 'ok' }}">{{ sys.update_total }}</span><span class="of"> missing security update{{ 's' if sys.update_total != 1 }}</span>{% else %}<span class="quiet">–</span>{% endif %}</div>
+    <div class="pillar-sub">{% if sys.reported %}{{ sys.reported }} of {{ agents|length }} host{{ 's' if agents|length != 1 }} report their packages{% if not sys.enabled %} · <span class="warn">update check off</span>{% endif %}{% elif agents %}no host reports its packages yet{% else %}no hosts yet{% endif %}</div>
+    <div class="pillar-stats">
+      <div><span class="k">Critical</span><span class="v {{ 'warn' if sys.updates.high }}">{{ sys.updates.high }}</span></div>
+      <div><span class="k">Medium</span><span class="v {{ 'warn' if sys.updates.middle }}">{{ sys.updates.middle }}</span></div>
+      <div><span class="k">Reboot needed</span><span class="v {{ 'warn' if sys.reboot }}">{{ sys.reboot }}</span></div>
+      <div><span class="k">Disk space</span><span class="v {{ 'warn' if sys.storage }}">{{ sys.storage or 'ok' }}</span></div>
+    </div>
+    <ul class="pillar-list">
+      {% for a in agents[:6] %}
+      {% set worst = 'warn' if a.update_counts.high or a.update_counts.middle or a.os.reboot or (a.fullest and a.fullest.level) else 'ok' if a.os else 'missing' %}
+      <li><span class="dot {{ 'crit' if a.fullest and a.fullest.level == 'crit' else worst }}"></span><span class="t"><a href="{{ url_for('host', agent_id=a.id) }}">{{ a.name }}</a>
+        <span class="quiet">{{ a.os.name or 'system not reported' }}</span>
+        {%- if a.update_progress is not none %} · <span class="quiet">checking {{ a.update_progress }} %</span>
+        {%- elif a.update_total %} · <span class="{{ 'warn' if a.update_counts.high or a.update_counts.middle else 'quiet' }}">{{ a.update_total }} update{{ 's' if a.update_total != 1 }}</span>{% endif %}
+        {%- if a.os.reboot %} · <span class="warn">reboot</span>{% endif %}
+        {%- if a.fullest and a.fullest.level %} · <span class="{{ a.fullest.level }}">{{ a.fullest.name }} {{ a.fullest.percent }} %</span>{% endif %}</span></li>
+      {% else %}
+      <li class="quiet">Hosts show up here once their agent reports.</li>
+      {% endfor %}
+      {% if agents|length > 6 %}<li class="quiet"><a href="{{ url_for('systems_page') }}">and {{ agents|length - 6 }} more</a></li>{% endif %}
+    </ul>
+  </section>
+
+  {# --- Docker --- #}
+  {% set tone = 'warn' if image_counts.available or image_counts.error else 'ok' if images else 'none' %}
+  <section class="pillar tone-{{ tone }}">
+    <a class="pillar-head" href="{{ url_for('docker_page') }}"><h2><span class="dot {{ tone if tone != 'none' else 'missing' }}"></span>Docker</h2><span class="more">All images →</span></a>
+    <div class="pillar-value">{% if images %}<span class="{{ 'warn' if image_counts.available else 'ok' }}">{{ image_counts.available }}</span><span class="of"> update{{ 's' if image_counts.available != 1 }} available</span>{% else %}<span class="quiet">–</span>{% endif %}</div>
+    <div class="pillar-sub">{% if images %}{{ images|length }} image{{ 's' if images|length != 1 }} watched{% else %}no images watched yet{% endif %}</div>
+    <div class="pillar-stats">
+      <div><span class="k">Up to date</span><span class="v {{ 'ok' if image_counts.current }}">{{ image_counts.current }}</span></div>
+      <div><span class="k">Updates</span><span class="v {{ 'warn' if image_counts.available }}">{{ image_counts.available }}</span></div>
+      <div><span class="k">Errors</span><span class="v {{ 'crit' if image_counts.error }}">{{ image_counts.error }}</span></div>
+      <div><span class="k">Waiting</span><span class="v">{{ image_counts.pending }}</span></div>
+    </div>
+    <ul class="pillar-list">
+      {% set open = images|rejectattr('state', 'equalto', 'current')|list %}
+      {% for i in open[:5] %}
+      <li><span class="dot {{ {'available': 'warn', 'error': 'crit'}.get(i.state, 'missing') }}"></span><a href="{{ url_for('docker_page') }}#image-{{ i.id }}">{% if i.state == 'available' %}{{ update_text(i) }}{% elif i.state == 'error' %}{{ i.name }}: {{ i.error }}{% else %}{{ i.name }}: waiting for the first check{% endif %}</a></li>
+      {% else %}
+      <li class="quiet">{% if images %}All images are up to date.{% else %}<a href="{{ url_for('image_new') }}">Add an image</a> to hear about new versions.{% endif %}</li>
+      {% endfor %}
+      {% if open|length > 5 %}<li class="quiet"><a href="{{ url_for('docker_page') }}">and {{ open|length - 5 }} more</a></li>{% endif %}
+    </ul>
+  </section>
 </div>
 
-<div class="grid-main">
-  <div>
-    {% if not agents %}
-    <div class="panel">
-      <h2>Welcome to mimamori</h2>
-      <p class="quiet">No agents yet. An agent runs on each host whose drives you want to watch and reports to this page.</p>
-      <a class="btn primary" href="{{ url_for('settings') }}#agents">Add your first agent</a>
-    </div>
-    {% endif %}
-
-    {# wide screens: cards #}
-    <div class="hosts-cards">
-    {% for a in agents %}
-    {% set worst_update = 'high' if a.update_counts.high else 'middle' if a.update_counts.middle else 'low' %}
-    <section class="host">
-      <div class="host-head">
-        <h2><a class="host-link" href="{{ url_for('host', agent_id=a.id) }}">{{ a.name }}</a>{% if a.location %}<span class="location">{{ a.location }}</span>{% endif %}
-          {% if a.update_total %}<a class="chip {{ 'warn' if worst_update != 'low' else 'quiet' }}" href="{{ url_for('host', agent_id=a.id) }}" title="{% for lvl in ['high', 'middle', 'low'] if a.update_counts[lvl] %}{{ a.update_counts[lvl] }} {{ lvl|sev }}{{ ', ' if not loop.last }}{% endfor %}"><span class="dot {{ 'warn' if worst_update != 'low' else 'missing' }}"></span>{{ a.update_total }} security update{{ 's' if a.update_total != 1 }}</a>{% endif %}
-          {% if a.firmware_issues %}<a class="chip warn" href="{{ url_for('host', agent_id=a.id) }}"><span class="dot warn"></span>{{ a.firmware_issues }} firmware</a>{% endif %}
-          {% for f in a.filesystems if f.level %}<a class="chip {{ f.level }}" href="{{ url_for('host', agent_id=a.id) }}#storage"><span class="dot {{ f.level }}"></span>{{ f.name }} {{ f.percent }} % full</a>{% endfor %}
-        </h2>
-        <span class="presence"><span class="dot {{ 'on' if a.online else 'crit' }}"></span>
-          {% if a.online %}agent online · reported {{ a.last_report|ago }}{% elif a.last_seen %}agent offline · last seen {{ a.last_seen|ago }}{% else %}waiting for the agent to connect{% endif %}
-        </span>
-      </div>
-      {% if a.os.name or a.update_progress is not none or a.update_queued %}
-      <a class="host-updates" href="{{ url_for('host', agent_id=a.id) }}">
-        {% if a.os.name %}<span>{{ a.os.name }}</span>{% endif %}
-        {% if a.os.reboot %}<span class="warn">reboot needed for the installed kernel update</span>{% endif %}
-        {% if a.update_progress is not none %}<span>checking for missing updates · {{ a.update_progress }} %</span>
-        {% elif a.update_queued %}<span>update check starts within a minute</span>
-        {% elif a.updates_checked and not a.update_total %}<span class="ok">no missing updates known</span>{% endif %}
-      </a>
-      {% endif %}
-      {% if a.drives or a.fs_elsewhere %}
-      <div class="cards">
-        {% for d in a.drives %}
-        {% set s = d.latest %}
-        <a class="card {{ d.status }}" href="{{ url_for('drive', drive_id=d.id) }}">
-          <div class="card-head"><span class="badges">{% if d.no_smart %}<span class="badge"><span class="dot missing"></span>no smart data</span>{% else %}{{ badge(d.status) }}{% endif %}{% if d.fw %}<span class="badge fw-{{ d.fw.level }}" title="{{ d.fw.text }}">firmware</span>{% endif %}</span><span class="mono quiet">{{ d.device }}</span></div>
-          <h3 class="card-title">{{ d.model or 'Unknown drive' }}</h3>
-          {% if d.no_smart %}
-          <div class="card-meta">{{ 'Virtual disk' if d.virtual else d.kind|kind }}{% if d.capacity %} · {{ d.capacity|bytes }}{% endif %}</div>
-          <p class="card-note">{% if d.virtual %}This is a virtual drive, so it doesn't report temperature, hours or wear.{% else %}This drive or its controller passes no SMART data through, so temperature, hours and wear are unknown.{% endif %} Mimamori still checks that it responds.</p>
-          {% for f in d.fs %}{{ usage(f) }}{% endfor %}
-          <div class="card-foot">Checked {{ s.ts|time(false) }}</div>
-          {% else %}
-          <div class="card-meta">{{ d.kind|kind }}{% if d.capacity %} · {{ d.capacity|bytes }}{% endif %} · <span class="mono">{{ d.serial|serial }}</span></div>
-          <div class="metrics">
-            {% if d.status == 'missing' %}
-            <div><div class="k">Temp</div><div class="v">–</div></div>
-            <div><div class="k">Power on</div><div class="v">–</div></div>
-            <div><div class="k">Last seen</div><div class="v">{{ d.last_seen|time(false) }}</div></div>
-            {% else %}
-            {% if d.temp_ignored %}<div><div class="k">Temp</div><div class="v quiet">off</div></div>
-            {% else %}<div><div class="k">Temp</div><div class="v {{ d.issues.temp.level if d.issues.temp }}">{{ '–' if s.temp is none else s.temp ~ ' °C' }}</div></div>{% endif %}
-            <div><div class="k">Power on</div><div class="v">{{ s.power_on_hours|num }} h</div></div>
-            {% if d.kind == 'hdd' or (s.wear is none and s.reallocated is not none) %}
-              {% if s.pending and not s.reallocated %}
-              <div><div class="k">Pending</div><div class="v {{ d.issues.pending.level if d.issues.pending }}">{{ s.pending|num }}</div></div>
-              {% else %}
-              <div><div class="k">Realloc</div><div class="v {{ d.issues.reallocated.level if d.issues.reallocated }}">{{ s.reallocated|num }}</div></div>
-              {% endif %}
-            {% else %}
-            <div><div class="k">Wear</div><div class="v {{ d.issues.wear.level if d.issues.wear }}">{{ '–' if s.wear is none else s.wear ~ ' %' }}</div></div>
-            {% endif %}
-            {% endif %}
-          </div>
-          {% if d.spark %}
-          <svg class="spark {{ d.status }}" viewBox="0 0 180 28" preserveAspectRatio="none" aria-hidden="true"><polyline points="{{ d.spark }}"></polyline></svg>
-          {% else %}<div class="spark"></div>{% endif %}
-          {% for f in d.fs %}{{ usage(f) }}{% endfor %}
-          <div class="card-foot">
-            {% if d.status == 'missing' %}Not responding to smartctl since {{ d.last_seen|time(false) }}
-            {% elif d.summary %}Checked {{ s.ts|time(false) }} · {{ d.summary }}
-            {% elif d.fw %}Checked {{ s.ts|time(false) }} · <span class="warn">firmware update recommended</span>
-            {% elif d.standby %}Asleep (standby) · not woken up for the check
-            {% elif d.temp_ignored %}Checked {{ s.ts|time(false) }} · temperature ignored
-            {% else %}Checked {{ s.ts|time(false) }} · 14 days of temperature{% endif %}
-          </div>
-          {% endif %}
-        </a>
-        {% endfor %}
-        {# Filesystems on no watched drive (ZFS, network shares, drives not passed to the agent) #}
-        {% for f in a.fs_elsewhere %}
-        {% set st = {'crit': 'failing', 'warn': 'watch'}.get(f.level, 'healthy') %}
-        <a class="card fs-card {{ st if f.level }}" href="{{ url_for('host', agent_id=a.id) }}#storage">
-          <div class="card-head"><span class="badges"><span class="badge {{ st }}"><span class="dot {{ st }}"></span>{{ {'crit': 'almost full', 'warn': 'filling up'}.get(f.level, 'disk space') }}</span></span><span class="mono quiet">{{ f.source or f.name }}</span></div>
-          <h3 class="card-title">{{ f.name }}</h3>
-          <div class="card-meta">Filesystem · {{ f.fstype or 'unknown type' }}</div>
-          <div class="metrics">
-            <div><div class="k">Used</div><div class="v {{ f.level }}">{{ f.percent }} %</div></div>
-            <div><div class="k">Free</div><div class="v">{{ f.free|bytes }}</div></div>
-            <div><div class="k">Size</div><div class="v">{{ f.total|bytes }}</div></div>
-          </div>
-          <div class="fs-card-bar">{{ usage_bar(f) }}</div>
-          <div class="card-foot">Reported {{ f.reported|time(false) }} · {% if f.disks %}on <span class="mono">{{ f.disks|join(', ') }}</span>, a drive the agent does not watch{% else %}not on a single drive{% endif %}</div>
-        </a>
-        {% endfor %}
-      </div>
-      {% else %}
-      <p class="empty">No drives reported by this agent yet.</p>
-      {% endif %}
-    </section>
-    {% endfor %}
-    </div>
-
-    {# narrow screens: compact rows #}
-    <div class="rows">
-    {% for a in agents %}
-      <a class="host-caption" href="{{ url_for('host', agent_id=a.id) }}">{{ a.name }}{% if a.location %} · {{ a.location }}{% endif %}{% if not a.online %} · <span class="crit">offline</span>{% endif %}{% if a.update_total %} · <span class="{{ 'warn' if a.update_counts.high or a.update_counts.middle else 'quiet' }}">{{ a.update_total }} security update{{ 's' if a.update_total != 1 }}</span>{% endif %}{% if a.firmware_issues %} · <span class="warn">firmware</span>{% endif %}{% for f in a.filesystems if f.level %} · <span class="{{ f.level }}">{{ f.name }} {{ f.percent }} % full</span>{% endfor %}</a>
-      {% for d in a.drives %}
-      {% set s = d.latest %}
-      <a class="drow {{ d.status }}" href="{{ url_for('drive', drive_id=d.id) }}">
-        <span class="dot {{ 'missing' if d.no_smart else d.status }}"></span>
-        <div>
-          <div class="t">{{ d.model or 'Unknown drive' }} · {{ d.device|replace('/dev/', '') }}</div>
-          <div class="s">{% if d.status == 'missing' %}Missing since {{ d.last_seen|time(false) }}{% elif d.no_smart %}No SMART data{% if d.virtual %} · virtual disk{% endif %}{% elif d.summary %}{{ d.status|capitalize }} · {{ d.summary }}{% elif s.wear is not none %}Healthy · {{ s.wear }} % worn{% else %}Healthy · {{ s.power_on_hours|num }} h{% endif %}{% if d.fw %} · <span class="warn">firmware update</span>{% endif %}{% for f in d.fs %} · <span class="{{ f.level }}">{{ f.name }} {{ f.percent }} %</span>{% endfor %}</div>
-        </div>
-        <span class="temp">{{ '–' if d.status == 'missing' or s.temp is none else s.temp ~ '°' }}</span>
-      </a>
-      {% else %}
-      {% if not a.fs_elsewhere %}<p class="empty">No drives reported yet.</p>{% endif %}
-      {% endfor %}
-      {% for f in a.fs_elsewhere %}
-      <a class="drow" href="{{ url_for('host', agent_id=a.id) }}#storage">
-        <span class="dot {{ {'crit': 'failing', 'warn': 'watch'}.get(f.level, 'healthy') }}"></span>
-        <div>
-          <div class="t">{{ f.name }} · {{ f.fstype or 'filesystem' }}</div>
-          <div class="s">{{ f.free|bytes }} free of {{ f.total|bytes }}</div>
-        </div>
-        <span class="temp {{ f.level }}">{{ f.percent }} %</span>
-      </a>
-      {% endfor %}
-    {% endfor %}
-    </div>
+<div class="grid-three">
+  <div class="panel">
+    <div class="panel-head"><h2>Status and backups</h2><a class="small" href="{{ url_for('status_page') }}">Status →</a></div>
+    <dl class="facts">
+      <dt>Sites and services</dt><dd>{% if watch.monitors %}<span class="{{ 'crit' if watch.down else 'ok' }}">{{ watch.monitors - watch.down }} of {{ watch.monitors }} up</span>{% else %}<a href="{{ url_for('monitor_new') }}">add a check</a>{% endif %}</dd>
+      <dt>Backups and jobs</dt><dd>{% if watch.pushes %}<span class="{{ 'crit' if watch.push_bad else 'ok' }}">{% if watch.push_bad %}{{ watch.push_bad }} failed or overdue{% else %}all {{ watch.pushes }} in time{% endif %}</span>{% else %}<a href="{{ url_for('push_new') }}">add one</a>{% endif %}</dd>
+    </dl>
   </div>
-
-  <aside>
-    <div class="panel">
-      <div class="panel-head"><h2>Recent alerts</h2><a class="small" href="{{ url_for('alerts') }}">All alerts</a></div>
-      <ul class="alert-list">
-        {% for a in alerts %}{{ alert_item(a) }}{% else %}<li class="empty">No alerts yet. Calm waters.</li>{% endfor %}
-      </ul>
-    </div>
-    <div class="panel">
-      <div class="quiet small">Weekly report</div>
-      {% if report_next %}
-      <p class="report-time">{{ report_next.strftime('%A %H:%M') }} · {{ report_next.tzname() }}</p>
-      {% else %}<p class="report-time">Turned off</p>{% endif %}
-      <p class="quiet small">{% if channels %}Goes to {{ channels|join(', ') }}.{% else %}No notification channel configured yet.{% endif %}
-        {% if report_last %}Last sent {{ report_last|time }}.{% endif %}</p>
-      <a class="small" href="{{ url_for('report_page') }}">Preview this week's report</a>
-    </div>
-  </aside>
+  <div class="panel">
+    <div class="panel-head"><h2>Recent alerts</h2><a class="small" href="{{ url_for('alerts') }}">All alerts →</a></div>
+    <ul class="alert-list">
+      {% for a in alerts[:3] %}{{ alert_item(a) }}{% else %}<li class="empty">No alerts yet. Calm waters.</li>{% endfor %}
+    </ul>
+  </div>
+  <div class="panel">
+    <div class="panel-head"><h2>Weekly report</h2><a class="small" href="{{ url_for('report_page') }}">Preview →</a></div>
+    {% if report_next %}
+    <p class="report-time">{{ report_next.strftime('%A %H:%M') }} · {{ report_next.tzname() }}</p>
+    {% else %}<p class="report-time">Turned off</p>{% endif %}
+    <p class="quiet small">{% if channels %}Goes to {{ channels|join(', ') }}.{% else %}No notification channel configured yet.{% endif %}
+      {% if report_last %}Last sent {{ report_last|time }}.{% endif %}</p>
+  </div>
 </div>
 {% endblock %}

@@ -654,6 +654,50 @@ CREATE TABLE IF NOT EXISTS monitor_hours (
     ms_max INTEGER,
     PRIMARY KEY (monitor_id, hour)
 );
+-- Added in 0.3.3: Docker images whose registry is asked for newer versions. You update by
+-- hand and confirm it on the page; the agents are not involved.
+CREATE TABLE IF NOT EXISTS images (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    image TEXT NOT NULL,                      -- e.g. docker.io/library/nginx (see parse_image)
+    version TEXT NOT NULL,                    -- the tag you run, e.g. 1.27.2 or latest
+    track TEXT NOT NULL,                      -- stable, major, beta or digest (IMAGE_TRACKS)
+    location TEXT NOT NULL DEFAULT '',        -- where it runs, e.g. the compose file (a note)
+    created INTEGER NOT NULL,
+    digest TEXT NOT NULL DEFAULT '',          -- digest: the image you run (confirmed)
+    latest TEXT NOT NULL DEFAULT '',          -- the newest version (or digest) found, '' if none
+    newer TEXT NOT NULL DEFAULT '[]',         -- the newer versions found, newest first
+    found INTEGER,                            -- when `latest` was first seen
+    checked INTEGER,                          -- NULL: check soon
+    error TEXT NOT NULL DEFAULT '',
+    muted INTEGER NOT NULL DEFAULT 0
+);
+-- Added in 0.3.3: push checks. A backup (Backrest) or a cron job calls its secret URL when it
+-- ran; mimamori alerts when it reports a failure or does not report in time.
+CREATE TABLE IF NOT EXISTS heartbeats (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,          -- SHA-256 of the secret in the URL, never the secret
+    interval INTEGER NOT NULL DEFAULT 86400,  -- seconds between two runs
+    grace INTEGER NOT NULL DEFAULT 7200,      -- seconds a run may be late before it is overdue
+    created INTEGER NOT NULL,
+    armed INTEGER NOT NULL,                   -- the deadline counts from here (created, resumed)
+    status TEXT NOT NULL DEFAULT 'new',       -- new, up, late or failed
+    running INTEGER,                          -- start of a run that has not ended yet
+    last_ping INTEGER,
+    last_success INTEGER,
+    last_change INTEGER,
+    last_message TEXT NOT NULL DEFAULT '',
+    paused INTEGER NOT NULL DEFAULT 0,
+    muted INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS heartbeat_pings (
+    heartbeat_id INTEGER NOT NULL REFERENCES heartbeats(id) ON DELETE CASCADE,
+    ts INTEGER NOT NULL,
+    kind TEXT NOT NULL,                       -- success, start, fail or log
+    message TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS heartbeat_pings_ts ON heartbeat_pings (heartbeat_id, ts);
 """
 
 
@@ -665,6 +709,10 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("drives", "temp_ignored", "INTEGER NOT NULL DEFAULT 0"),
     # Alerts of the status monitor (0.3.2), which belong to no agent
     ("alerts", "monitor_id", "INTEGER REFERENCES monitors(id) ON DELETE CASCADE"),
+    # Alerts of the Docker image check (0.3.3)
+    ("alerts", "image_id", "INTEGER REFERENCES images(id) ON DELETE CASCADE"),
+    # Alerts of the push checks (0.3.3)
+    ("alerts", "heartbeat_id", "INTEGER REFERENCES heartbeats(id) ON DELETE CASCADE"),
 ]
 
 
@@ -758,6 +806,8 @@ ALERT_LABELS = {
     "agent_online": "Agent online", "test": "Test", "report": "Weekly report",
     "updates": "Missing updates", "firmware": "Firmware", "storage": "Disk space",
     "monitor_down": "Down", "monitor_up": "Up", "monitor_tls": "Certificate",
+    "docker": "Docker image",
+    "push_fail": "Failed", "push_late": "Overdue", "push_ok": "Back",
 }
 CHANNELS = ("Discord", "mail", "webhook")
 SEVERITIES = ("low", "middle", "high")
@@ -779,6 +829,10 @@ NOTIFY_TOPICS: dict[str, tuple[str, bool]] = {
     "monitor_high": ("Status monitor · critical: site or service down", True),
     "monitor_middle": ("Status monitor · medium: certificate expires soon", True),
     "monitor_ok": ("Status monitor: back up, certificate renewed", True),
+    # Off by default: the overview shows it, and some images get a new version every week
+    "docker": ("Docker images: a new version is available", False),
+    "push_high": ("Backups and jobs · critical: failed or overdue", True),
+    "push_ok": ("Backups and jobs: ran fine again", True),
     "agent":("Agent offline or back online", True),
     "report": ("Weekly report", True),
 }
@@ -1428,6 +1482,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # A filesystem is filling up (medium) or almost full (critical) at this percentage used
     "fs_warn_percent": 85,
     "fs_crit_percent": 95,
+    # Docker images: how often their registries are asked (hours, 0 = only on "Check")
+    "docker_check_hours": 12,
     # Part of every session; logging out raises it, which ends every session at once. The
     # session lives only in the signed cookie, so this is how the server can revoke it.
     "session_generation": 0,
@@ -1804,6 +1860,345 @@ def monitor_history(db: "Database", monitor_id: int, since: int,
         (monitor_id, since, monitor_id, since))]
 
 
+# ============================================================================
+# Docker images: the server asks the image's registry (Docker Hub, GHCR, …) whether a newer
+# version exists. Nothing is pulled and nothing on the hosts changes: you update by hand and
+# confirm it on the page. The agents are not involved and get no new rights.
+# Image names are typed in on the page, so the rules of the status monitor apply: HTTPS
+# only with a valid certificate, never loopback, link-local or reserved addresses, and the
+# connection goes to the address that was checked. Public images only: no registry
+# passwords are stored, and tokens the registry hands out are kept in memory for one check.
+# ============================================================================
+
+IMAGE_TRACKS = {
+    "stable": "Newer stable versions",
+    "major": "Newer stable versions with the same major version (e.g. 16.x of PostgreSQL 16)",
+    "beta": "Newer versions, betas and release candidates included",
+    "digest": "This tag (e.g. latest or beta): tell me when it points to a new image",
+}
+IMAGE_CHECK_HOURS = {0: "only when I click Check", 6: "every 6 hours", 12: "every 12 hours",
+                     24: "once a day"}
+MAX_IMAGES = 100
+IMAGE_WORKERS = 2
+REGISTRY_TIMEOUT = 15
+MAX_REGISTRY_BYTES = 4 * 1024 * 1024
+MAX_TAG_PAGES = 20             # of 1,000 tags each
+MAX_NEWER = 20
+MAX_TOKEN = 8192
+DOCKER_HUB_NAMES = ("docker.io", "index.docker.io", "registry-1.docker.io",
+                    "registry.hub.docker.com")
+_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+IMAGE_PATH = re.compile(rf"^{_COMPONENT}(?:/{_COMPONENT}){{0,7}}$")
+IMAGE_TAG = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
+IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+TOKEN_CHARS = re.compile(r"^[\x21-\x7e]+$")
+# 1.2.3, v1.2, 0.3.3-beta.1, 5.0rc2, 1.27.2-alpine, 4.0.11.2680-ls250 …
+VERSION_TAG = re.compile(r"^(v?)(\d{1,9}(?:\.\d{1,9}){0,3})"
+                         r"(?:[-_.]?(alpha|beta|preview|pre|rc)(?:[-_.]?(\d{1,9}))?(?![a-z]))?"
+                         r"((?:[-_.][A-Za-z0-9._-]*)?)$", re.I)
+PRE_ORDER = {"alpha": 0, "beta": 1, "pre": 2, "preview": 2, "rc": 3}
+MANIFEST_TYPES = ("application/vnd.oci.image.index.v1+json",
+                  "application/vnd.docker.distribution.manifest.list.v2+json",
+                  "application/vnd.oci.image.manifest.v1+json",
+                  "application/vnd.docker.distribution.manifest.v2+json")
+
+
+class RegistryError(ProbeError):
+    """A check of an image that failed, with a message for the page."""
+
+
+def parse_image(raw: str) -> tuple[str, str]:
+    """An image as typed in ("nginx", "ghcr.io/owner/app:1.2") as the stored name
+    ("docker.io/library/nginx") and the tag that came with it ("" if none), or ValueError."""
+    ref = raw.strip()
+    if not ref or len(ref) > 255 or not URL_CHARS.match(ref) or "://" in ref:
+        raise ValueError("Enter the image like nginx, linuxserver/sonarr or "
+                         "ghcr.io/owner/app, without https://.")
+    if "@" in ref:
+        raise ValueError("Enter the image with a version, not with a digest (@sha256:…).")
+    first, sep, rest = ref.partition("/")
+    if sep and ("." in first or ":" in first or first.lower() == "localhost"):
+        registry, path = first.lower(), rest
+    else:
+        registry, path = "docker.io", ref
+    tag = ""
+    if ":" in path.rsplit("/", 1)[-1]:
+        path, tag = path.rsplit(":", 1)
+        if not IMAGE_TAG.match(tag):
+            raise ValueError("The version after the colon is not a valid tag.")
+    if not IMAGE_PATH.match(path):
+        raise ValueError("The image name may only contain lower-case letters, digits, "
+                         "dots, dashes and slashes, like owner/app.")
+    if registry in DOCKER_HUB_NAMES:
+        registry = "docker.io"
+        if "/" not in path:
+            path = "library/" + path  # official images
+    else:
+        host, _, port = registry.rpartition(":") if registry.count(":") == 1 else (registry, "", "")
+        check_host(host)
+        if port and (not port.isdigit() or not 1 <= int(port) <= 65535):
+            raise ValueError("The port of the registry is not valid.")
+    return f"{registry}/{path}", tag
+
+
+def image_display(image: str) -> str:
+    """The name as you would type it: nginx, owner/app or ghcr.io/owner/app."""
+    if image.startswith("docker.io/library/") and image.count("/") == 2:
+        return image[len("docker.io/library/"):]
+    return image.removeprefix("docker.io/")
+
+
+def parse_version_tag(tag: str) -> dict | None:
+    """The parts of a tag that is a version number, or None (latest, stable, bookworm …)."""
+    m = VERSION_TAG.match(tag)
+    if not m:
+        return None
+    prefix, nums, pre, pre_n, variant = m.groups()
+    variant = variant.lower()
+    return {"prefix": prefix.lower(), "nums": tuple(int(n) for n in nums.split(".")),
+            "pre": (PRE_ORDER[pre.lower()], int(pre_n or 0)) if pre else None,
+            # e.g. "-alpine" or "-ls#": only tags of the same kind are compared, and numbers
+            # in it (a build number such as -ls250) count after the version
+            "shape": re.sub(r"\d+", "#", variant),
+            "build": tuple(int(n) for n in re.findall(r"\d+", variant)[:8])}
+
+
+def _version_key(v: dict) -> tuple:
+    # A release comes after its own betas and release candidates
+    return v["nums"], v["pre"] is None, v["pre"] or (0, 0), v["build"]
+
+
+def newer_versions(current: str, tags: Iterable[Any], track: str) -> list[str]:
+    """The tags newer than `current` that fit the track, newest first (at most MAX_NEWER).
+    Only tags of the same form count: 1.27.2-alpine is followed by 1.27.3-alpine, not by
+    1.27.3 or by the floating tag 1.27."""
+    cur = parse_version_tag(current)
+    if cur is None:
+        return []
+    found = []
+    for tag in tags:
+        if not isinstance(tag, str) or not IMAGE_TAG.match(tag):
+            continue
+        v = parse_version_tag(tag)
+        if (v is None or v["prefix"] != cur["prefix"] or len(v["nums"]) != len(cur["nums"])
+                or v["shape"] != cur["shape"]):
+            continue
+        if track != "beta" and v["pre"] is not None:
+            continue
+        if track == "major" and v["nums"][0] != cur["nums"][0]:
+            continue
+        if _version_key(v) > _version_key(cur):
+            found.append((_version_key(v), tag))
+    found.sort(reverse=True)
+    return [tag for _, tag in found[:MAX_NEWER]]
+
+
+def registry_location(image: str) -> tuple[str, str]:
+    """The base URL of the registry API and the repository, for a stored image name."""
+    registry, repo = image.split("/", 1)
+    return f"https://{'registry-1.docker.io' if registry == 'docker.io' else registry}", repo
+
+
+def _registry_request(url: str, headers: dict[str, str],
+                      method: str = "GET") -> tuple[int, dict[str, str], bytes]:
+    """One HTTPS request to a checked address; the answer is limited in size and time."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or parts.username is not None or not parts.hostname:
+        raise RegistryError("The registry sent mimamori to an address that is not https://")
+    try:
+        host = check_host(parts.hostname)
+        port = parts.port or 443
+    except ValueError:
+        raise RegistryError("The registry sent mimamori to an invalid address") from None
+    addrs = resolve(host, port)
+    sock: socket.socket = _connect(addrs, REGISTRY_TIMEOUT)
+    try:
+        with _Deadline(REGISTRY_TIMEOUT * 2) as deadline:
+            deadline.sock = sock
+            sock, _ = _tls(sock, host, True)
+            deadline.sock = sock
+            conn = http.client.HTTPConnection(host, port, timeout=REGISTRY_TIMEOUT)
+            conn.sock = sock  # already connected to the checked address
+            path = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
+            conn.request(method, path, headers={
+                "Host": parts.netloc, "User-Agent": f"mimamori/{VERSION} (image check)",
+                "Connection": "close", **headers})
+            resp = conn.getresponse()
+            body = b"" if method == "HEAD" else resp.read(MAX_REGISTRY_BYTES + 1)
+            if len(body) > MAX_REGISTRY_BYTES:
+                raise RegistryError("The registry's answer is too large")
+            return resp.status, {k.lower(): v for k, v in resp.getheaders()}, body
+    finally:
+        sock.close()
+
+
+class RegistryClient:
+    """Reads the tags and digests of one public image. Bearer tokens the registry hands out
+    (anonymous, pull only) are sent only to the host that asked for them."""
+
+    def __init__(self, image: str):
+        self.base, self.repo = registry_location(image)
+        self.tokens: dict[str, str] = {}
+
+    def fetch(self, path: str, method: str = "GET",
+              accept: str = "application/json") -> tuple[int, dict[str, str], bytes]:
+        url = urllib.parse.urljoin(self.base, path)
+        asked: set[str] = set()
+        for _ in range(6):
+            netloc = urllib.parse.urlsplit(url).netloc.lower()
+            headers = {"Accept": accept}
+            if netloc in self.tokens:
+                headers["Authorization"] = f"Bearer {self.tokens[netloc]}"
+            status, hdrs, body = _registry_request(url, headers, method)
+            if status in (301, 302, 303, 307, 308) and hdrs.get("location"):
+                url = urllib.parse.urljoin(url, hdrs["location"])  # checked by the next request
+                continue
+            if status == 401 and netloc not in asked:
+                asked.add(netloc)
+                self.tokens[netloc] = self._token(hdrs.get("www-authenticate", ""))
+                continue
+            return status, hdrs, body
+        raise RegistryError("Too many redirects")
+
+    def _token(self, challenge: str) -> str:
+        scheme, _, rest = challenge.strip().partition(" ")
+        if scheme.lower() != "bearer":
+            raise RegistryError("The registry wants a user name and password. mimamori only "
+                                "checks public images.")
+        params = dict(re.findall(r'(\w+)="([^"]*)"', rest))
+        realm = params.get("realm", "")
+        if not realm.startswith("https://"):
+            raise RegistryError("The registry's login address is not https://")
+        query = {k: params[k] for k in ("service", "scope") if params.get(k)}
+        query.setdefault("scope", f"repository:{self.repo}:pull")
+        url = realm + ("&" if "?" in realm else "?") + urllib.parse.urlencode(query)
+        status, _, body = _registry_request(url, {"Accept": "application/json"})
+        if status != 200:
+            raise RegistryError(f"The registry gave no access token (HTTP {status})")
+        try:
+            data = json.loads(body)
+            token = data.get("token") or data.get("access_token") if isinstance(data, dict) \
+                else None
+        except ValueError:
+            token = None
+        if not isinstance(token, str) or not 0 < len(token) <= MAX_TOKEN \
+                or not TOKEN_CHARS.match(token):
+            raise RegistryError("The registry gave no usable access token")
+        return token
+
+    @staticmethod
+    def _check(status: int) -> None:
+        if status == 200:
+            return
+        if status in (401, 403):
+            raise RegistryError("The registry refused access: the image is private or "
+                                "does not exist")
+        if status == 404:
+            raise RegistryError("The registry does not know this image or tag")
+        if status == 429:
+            raise RegistryError("The registry asks to slow down (HTTP 429); the next check "
+                                "tries again")
+        raise RegistryError(f"The registry answered HTTP {status}")
+
+    def tags(self) -> list[str]:
+        path = f"/v2/{self.repo}/tags/list?n=1000"
+        tags: list[str] = []
+        for _ in range(MAX_TAG_PAGES):
+            status, hdrs, body = self.fetch(path)
+            self._check(status)
+            try:
+                data = json.loads(body)
+            except ValueError:
+                raise RegistryError("The registry's tag list is not valid JSON") from None
+            page = data.get("tags") if isinstance(data, dict) else None
+            if page is not None and not isinstance(page, list):
+                raise RegistryError("The registry's tag list is not valid")
+            tags += [t for t in page or [] if isinstance(t, str) and IMAGE_TAG.match(t)]
+            link = re.match(r'\s*<([^>]+)>\s*;\s*rel="?next"?', hdrs.get("link", ""))
+            if not link:
+                return tags
+            nxt = urllib.parse.urlsplit(urllib.parse.urljoin(self.base, link.group(1)))
+            # Only further pages of the same list
+            if nxt.netloc and nxt.netloc.lower() != urllib.parse.urlsplit(self.base).netloc \
+                    or nxt.path != f"/v2/{self.repo}/tags/list":
+                raise RegistryError("The registry's next page is somewhere else")
+            path = urllib.parse.urlunsplit(("", "", nxt.path, nxt.query, ""))
+        raise RegistryError(f"The image has more than {MAX_TAG_PAGES * 1000:,} tags")
+
+    def digest(self, tag: str) -> str:
+        """The digest the tag points to now. HEAD first: Docker Hub does not count it as a
+        pull, so it does not use up the hourly limit."""
+        path = f"/v2/{self.repo}/manifests/{tag}"
+        accept = ", ".join(MANIFEST_TYPES)
+        status, hdrs, _ = self.fetch(path, "HEAD", accept)
+        digest = hdrs.get("docker-content-digest", "")
+        if status == 200 and IMAGE_DIGEST.match(digest):
+            return digest
+        status, hdrs, body = self.fetch(path, "GET", accept)
+        self._check(status)
+        digest = hdrs.get("docker-content-digest", "")
+        return digest if IMAGE_DIGEST.match(digest) else \
+            "sha256:" + hashlib.sha256(body).hexdigest()
+
+
+def fetch_image_state(img: dict) -> dict:
+    """What the registry says about one image: {"tags": […]} or, for a followed tag,
+    {"digest": "sha256:…"}; {"error": "…"} when that fails. Never raises."""
+    try:
+        client = RegistryClient(img["image"])
+        if img["track"] == "digest":
+            return {"digest": client.digest(img["version"])}
+        return {"tags": client.tags()}
+    except Exception as exc:  # every failure is a result
+        return {"error": _probe_error(exc, REGISTRY_TIMEOUT)[:200]}
+
+
+# ============================================================================
+# Push checks: a backup (e.g. Backrest), a cron job or any other system calls a secret URL
+# when it ran, the way healthchecks.io works: POST …/<secret> when it succeeded, …/start when
+# it begins, …/fail when it failed, …/log for a note and …/<exit code>. mimamori alerts on a
+# failure, and when no success comes in time, which also catches a job that never started.
+# The URL is the only credential (Backrest's Healthchecks hook can send nothing else): 256
+# random bits, stored only as a hash, shown once. These routes are public, so they accept
+# only POST, read a small body, and count unknown secrets against the sender like failed
+# logins.
+# ============================================================================
+
+PUSH_INTERVALS = {3600: "1 hour", 6 * 3600: "6 hours", 12 * 3600: "12 hours",
+                  86400: "1 day", 2 * 86400: "2 days", 7 * 86400: "1 week",
+                  30 * 86400: "30 days"}
+PUSH_KINDS = ("success", "start", "fail", "log")
+MAX_HEARTBEATS = 100
+MAX_PUSH_BODY = 10 * 1024
+MAX_PUSH_MESSAGE = 1000
+PUSH_PER_HOUR = 120           # pings per check and hour that are taken; more get 429
+PUSH_HISTORY_DAYS = 90
+PUSH_TOKEN = re.compile(r"^[A-Za-z0-9_-]{43}$")
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def push_token_hash(token: str) -> str:
+    return hashlib.sha256(b"mimamori push\0" + token.encode()).hexdigest()
+
+
+def new_push_token() -> tuple[str, str]:
+    """A new secret for a push URL and its hash."""
+    token = secrets.token_urlsafe(32)  # 43 characters
+    return token, push_token_hash(token)
+
+
+def push_message(raw: bytes) -> str:
+    """The body of a ping as a note for the page: text only, no control characters."""
+    text = raw[:MAX_PUSH_BODY].decode("utf-8", "replace")
+    text = _CONTROL.sub(" ", text.replace("\r\n", "\n")).strip()
+    return text[:MAX_PUSH_MESSAGE]
+
+
+def push_deadline(hb: dict) -> int:
+    """When the check is overdue without another success."""
+    return max(hb["last_success"] or 0, hb["armed"]) + hb["interval"] + hb["grace"]
+
+
 def human_duration(seconds: int) -> str:
     seconds = max(0, int(seconds))
     if seconds < 90:
@@ -1867,6 +2262,10 @@ class Monitor:
         self._monitor_running: set[int] = set()
         self._monitor_lock = threading.Lock()
         self._monitor_pool = ThreadPoolExecutor(MONITOR_WORKERS, thread_name_prefix="status")
+        # Docker images: the same for the registry checks
+        self._image_running: set[int] = set()
+        self._image_lock = threading.Lock()
+        self._image_pool = ThreadPoolExecutor(IMAGE_WORKERS, thread_name_prefix="docker")
 
     def clock(self, ts: int) -> str:
         return dt.datetime.fromtimestamp(ts, self.tz).strftime("%H:%M")
@@ -2079,23 +2478,28 @@ class Monitor:
 
     def _alert(self, agent_id: str | None, drive: dict | None, kind: str, level: str,
                title: str, detail: str, topics: set[str] | None = None,
-               monitor: dict | None = None) -> None:
+               monitor: dict | None = None, image: dict | None = None,
+               heartbeat: dict | None = None) -> None:
         """Records an alert and sends it to the channels that want one of its `topics`
         (see NOTIFY_TOPICS); without topics to every channel. Alerts of the status monitor
-        pass `monitor` instead of an agent."""
+        pass `monitor` instead of an agent, those of the Docker image check `image`, those of
+        the push checks `heartbeat`."""
         alert_id = self.db.execute(
-            "INSERT INTO alerts (ts, agent_id, drive_id, monitor_id, kind, level, title, "
-            "detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO alerts (ts, agent_id, drive_id, monitor_id, image_id, heartbeat_id, "
+            "kind, level, title, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (int(time.time()), agent_id, drive["id"] if drive else None,
-             monitor["id"] if monitor else None, kind, level, title, detail)).lastrowid
-        if (drive and drive.get("muted")) or (monitor and monitor.get("muted")):
+             monitor["id"] if monitor else None, image["id"] if image else None,
+             heartbeat["id"] if heartbeat else None, kind, level, title, detail)).lastrowid
+        if any(x and x.get("muted") for x in (drive, monitor, image, heartbeat)):
             return
         only = self.channels_for(topics)
         if only is not None and not set(only) & set(self.notifier.configured()):
             return  # recorded and shown, but no channel wants it
         # An agent on a compromised host (or a flapping website) must not be able to flood
         # your channels: past the limit, alerts are still recorded and shown, but not sent
-        who, ident = ("monitor_id", monitor["id"]) if monitor else ("agent_id", agent_id)
+        who, ident = ("monitor_id", monitor["id"]) if monitor else \
+            ("image_id", image["id"]) if image else \
+            ("heartbeat_id", heartbeat["id"]) if heartbeat else ("agent_id", agent_id)
         recent = self.db.one(f"SELECT COUNT(*) AS n FROM alerts WHERE {who} = ? AND ts > ? "
                              "AND channels != 'not sent: limit'",
                              (ident, int(time.time()) - 3600))["n"]
@@ -2103,10 +2507,18 @@ class Monitor:
             self.db.execute("UPDATE alerts SET channels = 'not sent: limit' WHERE id = ?",
                             (alert_id,))
             log.warning("More than %d alerts within an hour from one %s; not sending more",
-                        NOTIFY_LIMIT_PER_HOUR, "monitor" if monitor else "agent")
+                        NOTIFY_LIMIT_PER_HOUR,
+                        "monitor" if monitor else "image" if image else
+                        "push check" if heartbeat else "agent")
             return
         if monitor:
             self._monitor_event(alert_id, monitor, kind, level, title, detail, topics, only)
+            return
+        if image:
+            self._image_event(alert_id, image, kind, level, title, detail, topics, only)
+            return
+        if heartbeat:
+            self._push_event(alert_id, heartbeat, kind, level, title, detail, topics, only)
             return
         agent = self.db.one("SELECT name FROM agents WHERE id = ?", (agent_id,))
         host = agent["name"] if agent else "unknown host"
@@ -2167,6 +2579,228 @@ class Monitor:
                             (", ".join(channels), alert_id))
 
         self.notifier.send(ev, done, only=only)
+
+    def _image_event(self, alert_id: int, image: dict, kind: str, level: str, title: str,
+                     detail: str, topics: set[str] | None, only: list[str] | None) -> None:
+        fields = {"Image": image_display(image["image"]), "Running": image["version"]}
+        if image["location"]:
+            fields["Where"] = image["location"]
+        ev = make_event(
+            kind, level, f"Update · {title}", detail, fields=fields,
+            footer="mimamori · Docker images",
+            url=f"{self.cfg.public_url}/docker#image-{image['id']}" if self.cfg.public_url else "",
+            extra={"host": "", "severity": "", "topics": sorted(topics or ()), "drive": None,
+                   "image": {"name": image["name"], "image": image_display(image["image"]),
+                             "version": image["version"], "track": image["track"],
+                             "latest": image["latest"]}})
+
+        def done(channels: list[str]) -> None:
+            self.db.execute("UPDATE alerts SET channels = ? WHERE id = ?",
+                            (", ".join(channels), alert_id))
+
+        self.notifier.send(ev, done, only=only)
+
+    def _push_event(self, alert_id: int, hb: dict, kind: str, level: str, title: str,
+                    detail: str, topics: set[str] | None, only: list[str] | None) -> None:
+        label = {"push_fail": "Failed", "push_late": "Overdue"}.get(kind, "OK")
+        fields = {"Expected": f"every {PUSH_INTERVALS.get(hb['interval'], human_duration(hb['interval']))}"}
+        if hb["last_success"]:
+            fields["Last success"] = dt.datetime.fromtimestamp(
+                hb["last_success"], self.tz).strftime("%d %b %Y %H:%M")
+        ev = make_event(
+            kind, level, f"{label} · {title}", detail, fields=fields,
+            footer="mimamori · backups and jobs",
+            url=f"{self.cfg.public_url}/status/push/{hb['id']}" if self.cfg.public_url else "",
+            extra={"host": "", "severity": topics_severity(topics),
+                   "topics": sorted(topics or ()), "drive": None,
+                   "heartbeat": {"name": hb["name"], "interval": hb["interval"],
+                                 "last_success": hb["last_success"]}})
+
+        def done(channels: list[str]) -> None:
+            self.db.execute("UPDATE alerts SET channels = ? WHERE id = ?",
+                            (", ".join(channels), alert_id))
+
+        self.notifier.send(ev, done, only=only)
+
+    # push checks ----------------------------------------------------------
+    def record_push(self, heartbeat_id: int, kind: str, message: str,
+                    now: int | None = None) -> bool:
+        """Stores one ping and alerts on a failure, or when a run succeeds after a failure or
+        a missed deadline. False when the check got too many pings within the hour."""
+        now = now or int(time.time())
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT * FROM heartbeats WHERE id = ?",
+                               (heartbeat_id,)).fetchone()
+            if row is None:
+                return False
+            hb = dict(row)
+            recent = conn.execute("SELECT COUNT(*) AS n FROM heartbeat_pings WHERE "
+                                  "heartbeat_id = ? AND ts > ?",
+                                  (heartbeat_id, now - 3600)).fetchone()["n"]
+            if recent >= PUSH_PER_HOUR:
+                return False
+            conn.execute("INSERT INTO heartbeat_pings (heartbeat_id, ts, kind, message) "
+                         "VALUES (?, ?, ?, ?)", (heartbeat_id, now, kind, message))
+            status = hb["status"]
+            if hb["paused"] or kind == "log":
+                conn.execute("UPDATE heartbeats SET last_ping = ? WHERE id = ?", (now, heartbeat_id))
+                return True
+            if kind == "start":
+                conn.execute("UPDATE heartbeats SET last_ping = ?, running = ? WHERE id = ?",
+                             (now, now, heartbeat_id))
+                return True
+            status = "up" if kind == "success" else "failed"
+            conn.execute(
+                "UPDATE heartbeats SET last_ping = ?, running = NULL, status = ?, "
+                "last_change = CASE WHEN status != ? THEN ? ELSE last_change END, "
+                "last_success = CASE WHEN ? = 'up' THEN ? ELSE last_success END, "
+                "last_message = ? WHERE id = ?",
+                (now, status, status, now, status, now, message, heartbeat_id))
+        took = f" after {human_duration(now - hb['running'])}" if hb["running"] else ""
+        note = f" It reported: {message[:300]}" if message else ""
+        if status == "failed":
+            self._alert(None, None, "push_fail", "crit", f"{hb['name']} failed",
+                        f"The run{took} reported a failure.{note}", topics={"push_high"},
+                        heartbeat=hb)
+        elif hb["status"] in ("late", "failed"):
+            what = "failed" if hb["status"] == "failed" else "was overdue"
+            self._alert(None, None, "push_ok", "ok", f"{hb['name']} ran fine again",
+                        f"It {what} since {self.clock(hb['last_change'] or now)}; "
+                        f"this run{took} succeeded.", topics={"push_ok"}, heartbeat=hb)
+        return True
+
+    def check_heartbeats(self, now: int | None = None) -> None:
+        """Alerts once for every check whose success did not come in time."""
+        now = now or int(time.time())
+        for row in self.db.all("SELECT * FROM heartbeats WHERE paused = 0 AND "
+                               "status IN ('new', 'up')"):
+            hb = dict(row)
+            if now <= push_deadline(hb):
+                continue
+            changed = self.db.execute(
+                "UPDATE heartbeats SET status = 'late', last_change = ? WHERE id = ? AND "
+                "status = ?", (now, hb["id"], hb["status"])).rowcount == 1
+            if not changed:
+                continue  # a ping came in meanwhile
+            every = PUSH_INTERVALS.get(hb["interval"], human_duration(hb["interval"]))
+            last = (f"The last success was {human_duration(now - hb['last_success'])} ago"
+                    if hb["last_success"] else "It has not reported a success yet")
+            running = (f"; a run started {human_duration(now - hb['running'])} ago and has "
+                       "not ended" if hb["running"] else "")
+            self._alert(None, None, "push_late", "crit", f"{hb['name']} is overdue",
+                        f"Expected every {every}. {last}{running}. Check that the job runs "
+                        "and can reach mimamori.", topics={"push_high"}, heartbeat=hb)
+
+    # Docker images --------------------------------------------------------
+    def _docker_loop(self) -> None:
+        while not self._stop.wait(30):
+            try:
+                self.check_due_images()
+            except Exception:  # keep the thread alive
+                log.exception("Docker image check failed")
+
+    def check_due_images(self) -> None:
+        """New images, those you asked to check, and the others every docker_check_hours."""
+        hours = int(self.setting("docker_check_hours"))
+        sql, params = "SELECT id FROM images WHERE checked IS NULL", ()
+        if hours:
+            sql, params = sql + " OR checked < ?", (int(time.time()) - hours * 3600,)
+        for row in self.db.all(sql, params):
+            self.check_image_soon(row["id"])
+
+    def check_image_soon(self, image_id: int) -> None:
+        """Checks an image on the worker threads, unless it is being checked already."""
+        with self._image_lock:
+            if image_id in self._image_running:
+                return
+            self._image_running.add(image_id)
+        self._image_pool.submit(self._image_job, image_id)
+
+    def image_checking(self, image_id: int) -> bool:
+        with self._image_lock:
+            return image_id in self._image_running
+
+    def _image_job(self, image_id: int) -> None:
+        try:
+            row = self.db.one("SELECT * FROM images WHERE id = ?", (image_id,))
+            if row is not None:
+                self.record_image(dict(row), fetch_image_state(dict(row)))
+        except Exception:
+            log.exception("Docker image check failed")
+        finally:
+            with self._image_lock:
+                self._image_running.discard(image_id)
+
+    def record_image(self, checked: dict, result: dict, now: int | None = None) -> None:
+        """Stores what the registry said about the image as it was when the check began
+        (`checked`), and alerts once for each newer version (or new image of a followed tag)."""
+        now = now or int(time.time())
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT * FROM images WHERE id = ?", (checked["id"],)).fetchone()
+            if row is None or any(row[k] != checked[k] for k in ("image", "version", "track")):
+                return  # removed, edited or confirmed meanwhile; a new check follows
+            img = dict(row)
+            if "error" in result:
+                conn.execute("UPDATE images SET error = ?, checked = ? WHERE id = ?",
+                             (result["error"], now, img["id"]))
+                return
+            error = ""
+            if img["track"] == "digest":
+                # The first check takes the image the tag points to now as the one you run
+                digest = img["digest"] or result["digest"]
+                latest = "" if result["digest"] == digest else result["digest"]
+                newer: list[str] = [latest] if latest else []
+            else:
+                tags = result["tags"]
+                newer = newer_versions(img["version"], tags, img["track"])
+                latest = newer[0] if newer else ""
+                digest = ""
+                if img["version"] not in tags:
+                    error = (f"{img['version']} is not among the tags of this image. Check the "
+                             "version you run (e.g. 1.2.3 or v1.2.3).")
+            conn.execute(
+                "UPDATE images SET digest = ?, latest = ?, newer = ?, error = ?, checked = ?, "
+                "found = CASE WHEN ? = '' THEN NULL WHEN latest != ? OR found IS NULL THEN ? "
+                "ELSE found END WHERE id = ?",
+                (digest, latest, json.dumps(newer), error, now, latest, latest, now, img["id"]))
+        if not latest or latest == img["latest"] or error:
+            return
+        name = img["name"]
+        if img["track"] == "digest":
+            title = f"{name}: :{img['version']} points to a new image"
+            what = f"The tag {img['version']} of {image_display(img['image'])} was updated."
+        else:
+            title = f"{name}: {latest} is available (you run {img['version']})"
+            what = (f"{len(newer)} newer version{'s' if len(newer) != 1 else ''} of "
+                    f"{image_display(img['image'])}")
+            what += f": {', '.join(newer[:5])}{' …' if len(newer) > 5 else ''}."                 if len(newer) > 1 else "."
+        where = f" in {img['location']}" if img["location"] else ""
+        self._alert(None, None, "docker", "warn", title,
+                    f"{what} Update it by hand{where} (e.g. docker compose pull, then docker "
+                    "compose up -d), then confirm it on the Docker page.",
+                    topics={"docker"}, image=img)
+
+    def confirm_image(self, image_id: int, version: str) -> bool:
+        """You updated: the new version (or, for a followed tag, its new image) is the one
+        you run now. False if `version` is not one of the newer ones found."""
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
+            if row is None or not row["latest"]:
+                return False
+            img = dict(row)
+            if img["track"] == "digest":
+                conn.execute("UPDATE images SET digest = latest, latest = '', newer = '[]', "
+                             "found = NULL, error = '' WHERE id = ?", (image_id,))
+                return True
+            newer = json.loads(img["newer"])
+            if version not in newer:
+                return False
+            rest = newer_versions(version, newer, img["track"])
+            conn.execute("UPDATE images SET version = ?, latest = ?, newer = ?, error = '', "
+                         "found = CASE WHEN ? = '' THEN NULL ELSE found END WHERE id = ?",
+                         (version, rest[0] if rest else "", json.dumps(rest),
+                          rest[0] if rest else "", image_id))
+        return True
 
     # status monitor -------------------------------------------------------
     def _status_loop(self) -> None:
@@ -2295,6 +2929,7 @@ class Monitor:
         # On its own thread: a check can take minutes and must not delay the offline alerts
         threading.Thread(target=self._updates_loop, name="updates", daemon=True).start()
         threading.Thread(target=self._status_loop, name="status", daemon=True).start()
+        threading.Thread(target=self._docker_loop, name="docker", daemon=True).start()
 
     def _updates_loop(self) -> None:
         while not self._stop.wait(60):
@@ -2476,6 +3111,7 @@ class Monitor:
         while not self._stop.wait(30):
             try:
                 self.check_offline()
+                self.check_heartbeats()
                 if time.time() - last_retention > 6 * 3600:
                     self.retention()
                     last_retention = time.time()
@@ -2506,6 +3142,8 @@ class Monitor:
             keep = max(cutoff, now - MONITOR_SAMPLE_DAYS * DAY)
             conn.execute("DELETE FROM monitor_samples WHERE ts < ?", (keep,))
             conn.execute("DELETE FROM monitor_hours WHERE hour < ?", (keep,))
+            conn.execute("DELETE FROM heartbeat_pings WHERE ts < ?",
+                         (max(cutoff, now - PUSH_HISTORY_DAYS * DAY),))
             # The full attribute tables are only needed for recent history
             conn.execute("UPDATE samples SET attrs = NULL WHERE ts < ? AND attrs IS NOT NULL",
                          (now - 35 * DAY,))
@@ -2916,6 +3554,7 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
     login_limiter = RateLimiter(MAX_TRIES, WINDOW)
     login_limiter_48 = RateLimiter(MAX_TRIES_48, WINDOW)
     agent_limiter = RateLimiter(30, 300)
+    push_limiter = RateLimiter(20, 300)  # unknown push URLs per address
     asset_version = _asset_version()
 
     # helpers --------------------------------------------------------------
@@ -2986,8 +3625,10 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
                 and session.get("gen") == monitor.setting("session_generation"))
 
     # security hooks -------------------------------------------------------
-    public = {"login", "static", "health", "favicon", "agent_heartbeat", "agent_report"}
-    agent_api = {"agent_heartbeat", "agent_report"}
+    # The agent API and the push URLs authenticate each request themselves (a signed message,
+    # a secret URL) and use no session, so they need neither a login nor a CSRF token
+    agent_api = {"agent_heartbeat", "agent_report", "push_success", "push_action"}
+    public = {"login", "static", "health", "favicon", *agent_api}
 
     @app.before_request
     def guard():
@@ -3168,6 +3809,42 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             abort(400)
         return reply({"ok": True, "drives": count})
 
+    # push API -------------------------------------------------------------
+    # The healthchecks.io scheme, which Backrest's "Healthchecks" hook and many scripts use.
+    # POST only, so that a link preview or a browser cannot report a run by just opening it.
+    def push(token: str, kind: str):
+        key = limit_key(client_ip())
+        if push_limiter.blocked(key):
+            abort(429)
+        row = db.one("SELECT id FROM heartbeats WHERE token_hash = ?",
+                     (push_token_hash(token),)) if PUSH_TOKEN.match(token) else None
+        if row is None:
+            push_limiter.hit(key)
+            log.warning("Push to an unknown URL from %s", client_ip())  # never the URL itself
+            abort(404)
+        try:
+            message = push_message(request.stream.read(MAX_PUSH_BODY))
+            taken = monitor.record_push(row["id"], kind, message)
+        except Exception:
+            # Handled here: Flask would log the failure with the request path, the secret URL
+            log.exception("Push for check %d failed", row["id"])
+            abort(500)
+        if not taken:
+            abort(429)
+        return Response("OK\n", mimetype="text/plain")
+
+    @app.post("/api/push/v1/<token>")
+    def push_success(token: str):
+        return push(token, "success")
+
+    @app.post("/api/push/v1/<token>/<action>")
+    def push_action(token: str, action: str):
+        if action in ("start", "fail", "log"):
+            return push(token, action)
+        if action.isdigit() and len(action) <= 3:  # a script's exit code: 0 is success
+            return push(token, "success" if int(action) == 0 else "fail")
+        abort(404)
+
     # pages ----------------------------------------------------------------
     def drive_cards() -> tuple[list[dict], list[dict]]:
         agents = [dict(a) for a in db.all("SELECT * FROM agents ORDER BY name COLLATE NOCASE")]
@@ -3245,7 +3922,7 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
 
         def add(level: str, kind: str, count: int, host: str, text: str, url: str) -> None:
             tone = "quiet" if level == "low" else \
-                "crit" if level == "high" and kind in ("drive", "agent", "storage", "monitor") \
+                "crit" if level == "high" and kind in ("drive", "agent", "storage", "monitor", "push") \
                 else "warn"
             items.append({"level": level, "kind": kind, "count": count, "host": host,
                           "text": text, "url": url, "tone": tone})
@@ -3288,6 +3965,15 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
                 days = max(0, (m["tls_expires"] - now) // DAY)
                 add("middle", "monitor", 1, "", f"The certificate of {m['name']} expires in "
                     f"{days} day{'s' if days != 1 else ''}", url)
+        for hb in db.all("SELECT * FROM heartbeats WHERE paused = 0 AND "
+                         "status IN ('late', 'failed') ORDER BY name COLLATE NOCASE"):
+            add("high", "push", 1, "", f"{hb['name']} "
+                + ("failed" if hb["status"] == "failed" else "is overdue"),
+                url_for("push_page", heartbeat_id=hb["id"]))
+        for img in db.all("SELECT * FROM images WHERE latest != '' AND error = '' "
+                          "ORDER BY name COLLATE NOCASE"):
+            add("middle", "docker", 1, "", image_update_text(dict(img)),
+                url_for("docker_page") + f"#image-{img['id']}")
         items.sort(key=lambda i: -SEVERITIES.index(i["level"]))
         return items
 
@@ -3300,30 +3986,84 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             "levels": {lvl: sum(i["count"] for i in items if i["level"] == lvl)
                        for lvl in reversed(SEVERITIES)},
             "kinds": {k: sum(i["count"] for i in items if i["kind"] == k)
-                      for k in ("updates", "drive", "firmware", "agent", "storage", "monitor")},
+                      for k in ("updates", "drive", "firmware", "agent", "storage", "monitor",
+                                "push", "docker")},
             "hosts": list(dict.fromkeys(i["host"] for i in items if i["host"])),
         }
 
+    def drive_stats(agents: list[dict], drives: list[dict]) -> dict:
+        warm = [d for d in drives if d["latest"].get("temp") is not None
+                and d["status"] != "missing"]
+        return {
+            "offline": sum(1 for a in agents if a["last_seen"] and not a["online"]),
+            "no_smart": [d for d in drives if d["no_smart"]],
+            "counts": {s: sum(1 for d in drives if d["status"] == s) for s in STATUS_ORDER},
+            "healthy": sum(1 for d in drives if d["status"] == "healthy" and not d["no_smart"]),
+            "firmware": sum(1 for d in drives if d["fw"]),
+            "warmest": max(warm, key=lambda d: d["latest"]["temp"], default=None)}
+
+    def system_stats(agents: list[dict]) -> dict:
+        """Hosts with what the overview and the systems page show about their system."""
+        for a in agents:
+            a["fullest"] = max(a["filesystems"], key=lambda f: f["percent"], default=None)
+            a["os_reported"] = bool(a["os"])
+        return {
+            "updates": {s: sum(a["update_counts"][s] for a in agents) for s in SEVERITIES},
+            "update_total": sum(a["update_total"] for a in agents),
+            "reboot": sum(1 for a in agents if a["os"].get("reboot")),
+            "storage": sum(1 for a in agents for f in a["filesystems"] if f["level"]),
+            "reported": sum(1 for a in agents if a["os"]),
+            "checking": any(a["update_progress"] is not None or a["update_queued"]
+                            for a in agents),
+            "enabled": monitor.setting("updates_check_enabled")}
+
     @app.get("/")
     def overview():
+        """One page for everything, drives, systems and Docker side by side; each has its
+        own page with the details."""
         agents, drives = drive_cards()
         items = attention_items(agents, drives)
         att = attention_summary(items)
         lead = POND[att["worst"]] if drives or items else "The pond is still."
-        warm = [d for d in drives if d["latest"].get("temp") is not None and d["status"] != "missing"]
+        images = [image_view(dict(r)) for r in db.all(
+            "SELECT * FROM images ORDER BY name COLLATE NOCASE")]
+        pushes = [dict(r) for r in db.all("SELECT status, paused FROM heartbeats")]
+        monitors = [dict(r) for r in db.all("SELECT status, paused FROM monitors")]
+        system = system_stats(agents)
         return render_template(
             "overview.html", agents=agents, drives=drives, lead=lead, items=items, att=att,
-            offline=sum(1 for a in agents if a["last_seen"] and not a["online"]),
-            no_smart=[d for d in drives if d["no_smart"]],
-            refresh=any(a["update_progress"] is not None or a["update_queued"] for a in agents),
-            counts={s: sum(1 for d in drives if d["status"] == s) for s in STATUS_ORDER},
-            warmest=max(warm, key=lambda d: d["latest"]["temp"], default=None),
+            ds=drive_stats(agents, drives), sys=system,
+            drive_items=[i for i in items if i["kind"] in ("drive", "firmware", "agent")],
+            images=images, update_text=image_update_text,
+            image_counts={k: sum(1 for i in images if i["state"] == k)
+                          for k in ("available", "error", "pending", "current")},
+            watch={"monitors": len(monitors),
+                   "down": sum(1 for m in monitors if m["status"] == "down" and not m["paused"]),
+                   "pushes": len(pushes),
+                   "push_bad": sum(1 for p in pushes if p["status"] in ("late", "failed")
+                                   and not p["paused"])},
+            refresh=system["checking"],
             alerts=db.all("SELECT al.*, a.name AS host FROM alerts al LEFT JOIN agents a "
                           "ON a.id = al.agent_id ORDER BY al.ts DESC, al.id DESC LIMIT 5"),
             today=dt.datetime.now(tz),
             report_next=monitor.next_report_time() if monitor.setting("report_enabled") else None,
             report_last=int(monitor.setting("report_delivered")),
             channels=monitor.report_channels())
+
+    @app.get("/drives")
+    def drives_page():
+        agents, drives = drive_cards()
+        return render_template("drives.html", agents=agents, drives=drives,
+                               ds=drive_stats(agents, drives))
+
+    @app.get("/systems")
+    def systems_page():
+        agents, _ = drive_cards()
+        system = system_stats(agents)
+        return render_template("systems.html", agents=agents, sys=system,
+                               refresh=system["checking"],
+                               fs_limits={"warn": monitor.setting("fs_warn_percent"),
+                                          "crit": monitor.setting("fs_crit_percent")})
 
     def get_drive(drive_id: int) -> dict:
         row = db.one("SELECT d.*, a.name AS host, a.location FROM drives d JOIN agents a "
@@ -3609,8 +4349,133 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             m["uptime"] = up.get(m["id"], {})
         rows.sort(key=lambda m: status_order.get(m["state"], 9))
         counts = {s: sum(1 for m in rows if m["state"] == s) for s in status_order}
-        return render_template("status.html", monitors=rows, counts=counts,
+        pushes = [heartbeat_view(dict(r), now) for r in db.all(
+            "SELECT * FROM heartbeats ORDER BY name COLLATE NOCASE")]
+        pushes.sort(key=lambda h: push_order.get(h["state"], 9))
+        return render_template("status.html", monitors=rows, counts=counts, pushes=pushes,
+                               push_problems=sum(1 for h in pushes
+                                                 if h["state"] in ("late", "failed")),
                                refresh=True, refresh_every=30)
+
+    # push checks ----------------------------------------------------------
+    push_order = {"failed": 0, "late": 1, "new": 2, "up": 3, "paused": 4}
+
+    def get_heartbeat(heartbeat_id: int) -> dict:
+        row = db.one("SELECT * FROM heartbeats WHERE id = ?", (heartbeat_id,))
+        if row is None:
+            abort(404)
+        return dict(row)
+
+    def heartbeat_view(hb: dict, now: int) -> dict:
+        hb["state"] = "paused" if hb["paused"] else hb["status"]
+        hb["interval_label"] = PUSH_INTERVALS.get(hb["interval"], human_duration(hb["interval"]))
+        hb["grace_label"] = human_duration(hb["grace"])
+        hb["deadline"] = push_deadline(hb)
+        return hb
+
+    def render_push_url(hb: dict, token: str):
+        # Shown once: the server keeps only a hash of the secret
+        return render_template("push_url.html", hb=hb, url=(
+            cfg.public_url or request.host_url.rstrip("/")) + f"/api/push/v1/{token}")
+
+    def push_form() -> tuple[dict, str]:
+        values: dict[str, Any] = {"name": clean_text(request.form.get("name", ""), 48),
+                                  "interval": form_int("interval", 3600, 30 * 86400),
+                                  "grace": form_int("grace_minutes", 5, 2880) * 60}
+        if not values["name"]:
+            return values, "Give the check a name, e.g. the backup plan."
+        if values["interval"] not in PUSH_INTERVALS:
+            return values, "Choose how often it runs from the list."
+        return values, ""
+
+    def render_push_form(hb: dict, error: str = "", code: int = 200):
+        if error:
+            flash(error, "error")
+        return render_template("push_form.html", hb=hb, intervals=PUSH_INTERVALS), code
+
+    @app.get("/status/push/new")
+    def push_new():
+        return render_push_form({"name": "", "interval": 86400, "grace": 7200})
+
+    @app.post("/status/push/new")
+    def push_create():
+        values, error = push_form()
+        if not error and db.one("SELECT COUNT(*) AS n FROM heartbeats")["n"] >= MAX_HEARTBEATS:
+            error = f"mimamori keeps at most {MAX_HEARTBEATS} push checks."
+        if error:
+            return render_push_form(values, error, 400)
+        token, digest = new_push_token()
+        now = int(time.time())
+        heartbeat_id = db.execute(
+            "INSERT INTO heartbeats (name, token_hash, interval, grace, created, armed) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (values["name"], digest, values["interval"], values["grace"], now, now)).lastrowid
+        log.info("Push check %s added", values["name"])
+        return render_push_url(get_heartbeat(heartbeat_id), token)
+
+    @app.get("/status/push/<int:heartbeat_id>")
+    def push_page(heartbeat_id: int):
+        hb = heartbeat_view(get_heartbeat(heartbeat_id), int(time.time()))
+        return render_template(
+            "push.html", hb=hb,
+            pings=db.all("SELECT * FROM heartbeat_pings WHERE heartbeat_id = ? "
+                         "ORDER BY ts DESC LIMIT 50", (heartbeat_id,)),
+            alerts=db.all("SELECT * FROM alerts WHERE heartbeat_id = ? ORDER BY ts DESC, "
+                          "id DESC LIMIT 10", (heartbeat_id,)),
+            refresh=True, refresh_every=30)
+
+    @app.get("/status/push/<int:heartbeat_id>/edit")
+    def push_edit(heartbeat_id: int):
+        return render_push_form(get_heartbeat(heartbeat_id))
+
+    @app.post("/status/push/<int:heartbeat_id>/edit")
+    def push_save(heartbeat_id: int):
+        get_heartbeat(heartbeat_id)
+        values, error = push_form()
+        if error:
+            return render_push_form(dict(values, id=heartbeat_id), error, 400)
+        db.execute("UPDATE heartbeats SET name = ?, interval = ?, grace = ? WHERE id = ?",
+                   (values["name"], values["interval"], values["grace"], heartbeat_id))
+        flash("Check saved.")
+        return redirect(url_for("push_page", heartbeat_id=heartbeat_id))
+
+    @app.post("/status/push/<int:heartbeat_id>/url")
+    def push_new_url(heartbeat_id: int):
+        hb = get_heartbeat(heartbeat_id)
+        token, digest = new_push_token()
+        db.execute("UPDATE heartbeats SET token_hash = ? WHERE id = ?", (digest, heartbeat_id))
+        log.info("New push URL for %s", hb["name"])
+        return render_push_url(hb, token)
+
+    @app.post("/status/push/<int:heartbeat_id>/pause")
+    def push_pause(heartbeat_id: int):
+        hb = get_heartbeat(heartbeat_id)
+        if hb["paused"]:  # the deadline counts from now, not from before the pause
+            db.execute("UPDATE heartbeats SET paused = 0, armed = ?, status = CASE WHEN "
+                       "status = 'late' THEN 'new' ELSE status END WHERE id = ?",
+                       (int(time.time()), heartbeat_id))
+        else:
+            db.execute("UPDATE heartbeats SET paused = 1 WHERE id = ?", (heartbeat_id,))
+        flash("Watching again." if hb["paused"] else
+              "Paused: pings are still recorded, but nothing is overdue and no alerts are sent.")
+        return redirect(url_for("push_page", heartbeat_id=heartbeat_id))
+
+    @app.post("/status/push/<int:heartbeat_id>/mute")
+    def push_mute(heartbeat_id: int):
+        hb = get_heartbeat(heartbeat_id)
+        db.execute("UPDATE heartbeats SET muted = ? WHERE id = ?",
+                   (0 if hb["muted"] else 1, heartbeat_id))
+        flash("Alerts unmuted." if hb["muted"] else
+              "Alerts muted. They still show up here, but no notifications are sent.")
+        return redirect(url_for("push_page", heartbeat_id=heartbeat_id))
+
+    @app.post("/status/push/<int:heartbeat_id>/delete")
+    def push_delete(heartbeat_id: int):
+        hb = get_heartbeat(heartbeat_id)
+        db.execute("DELETE FROM heartbeats WHERE id = ?", (heartbeat_id,))
+        log.info("Push check %s removed", hb["name"])
+        flash(f"{hb['name']} and its history were removed. Its URL no longer works.")
+        return redirect(url_for("status_page"))
 
     @app.get("/status/<int:monitor_id>")
     def monitor_page(monitor_id: int):
@@ -3768,6 +4633,179 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         flash(f"{m['name']} and its history were removed.")
         return redirect(url_for("status_page"))
 
+    # Docker images --------------------------------------------------------
+    def image_update_text(img: dict) -> str:
+        if img["track"] == "digest":
+            return f"{img['name']}: the tag {img['version']} points to a new image"
+        return f"{img['name']}: update from {img['version']} to {img['latest']} available"
+
+    def get_image(image_id: int) -> dict:
+        row = db.one("SELECT * FROM images WHERE id = ?", (image_id,))
+        if row is None:
+            abort(404)
+        return dict(row)
+
+    def image_view(img: dict) -> dict:
+        img["display"] = image_display(img["image"])
+        img["newer"] = json.loads(img["newer"])
+        img["track_label"] = IMAGE_TRACKS.get(img["track"], img["track"])
+        img["checking"] = monitor.image_checking(img["id"])
+        img["state"] = ("error" if img["error"] else "available" if img["latest"]
+                        else "pending" if img["checked"] is None else "current")
+        return img
+
+    @app.get("/docker")
+    def docker_page():
+        images = [image_view(dict(r)) for r in db.all(
+            "SELECT * FROM images ORDER BY name COLLATE NOCASE")]
+        order = {"available": 0, "error": 1, "pending": 2, "current": 3}
+        images.sort(key=lambda i: order[i["state"]])
+        counts = {s: sum(1 for i in images if i["state"] == s) for s in order}
+        hours = int(monitor.setting("docker_check_hours"))
+        return render_template(
+            "docker.html", images=images, counts=counts, hours=hours,
+            check_hours=IMAGE_CHECK_HOURS, update_text=image_update_text,
+            # While a check waits or runs, so its result shows up by itself
+            refresh=any(i["checking"] or i["checked"] is None for i in images))
+
+    def image_form() -> tuple[dict, str]:
+        """The fields of the add/edit form, and an error message for the form ("" if none)."""
+        f = request.form
+        values: dict[str, Any] = {
+            "name": clean_text(f.get("name", ""), 48),
+            "image": f.get("image", "").strip()[:255],
+            "version": f.get("version", "").strip()[:128],
+            "track": f.get("track", "") if f.get("track", "") in IMAGE_TRACKS else "stable",
+            "location": clean_text(f.get("location", "").strip(), 200)}
+        try:
+            image, tag = parse_image(values["image"])
+            version = values["version"] or tag
+            if tag and values["version"] and tag != values["version"]:
+                raise ValueError(f"The image ends in :{tag}, but the version says "
+                                 f"{values['version']}. Enter the version once.")
+            if not version:
+                raise ValueError("Enter the version you run, e.g. 1.27.2, or a tag like latest.")
+            if not IMAGE_TAG.match(version):
+                raise ValueError("The version may only contain letters, digits, dots, dashes "
+                                 "and underscores, like 1.27.2 or latest.")
+            if values["track"] != "digest" and parse_version_tag(version) is None:
+                raise ValueError(f"{version} is not a version number. For a tag like latest "
+                                 "or beta, choose \"This tag\" under What counts as an update.")
+            values.update(image=image, version=version)
+            if not values["name"]:
+                values["name"] = clean_text(image.rsplit("/", 1)[-1], 48)
+        except ValueError as exc:
+            return values, str(exc)
+        return values, ""
+
+    def render_image_form(img: dict, error: str = "", code: int = 200):
+        if error:
+            flash(error, "error")
+        if not img.get("_typed"):  # stored names are shown as you would type them
+            img = dict(img, image=image_display(img["image"]))
+        return render_template("docker_form.html", i=img, tracks=IMAGE_TRACKS), code
+
+    @app.get("/docker/new")
+    def image_new():
+        return render_image_form({"name": "", "image": "", "version": "", "track": "stable",
+                                  "location": ""})
+
+    @app.post("/docker/new")
+    def image_create():
+        values, error = image_form()
+        if not error and db.one("SELECT COUNT(*) AS n FROM images")["n"] >= MAX_IMAGES:
+            error = f"mimamori watches at most {MAX_IMAGES} images."
+        if error:
+            return render_image_form(dict(values, _typed=True), error, 400)
+        image_id = db.execute(
+            "INSERT INTO images (name, image, version, track, location, created) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (values["name"], values["image"], values["version"], values["track"],
+             values["location"], int(time.time()))).lastrowid
+        log.info("Docker image %s added", values["name"])
+        monitor.check_image_soon(image_id)
+        flash(f"{values['name']} is checked now.")
+        return redirect(url_for("docker_page") + f"#image-{image_id}")
+
+    @app.get("/docker/<int:image_id>/edit")
+    def image_edit(image_id: int):
+        return render_image_form(get_image(image_id))
+
+    @app.post("/docker/<int:image_id>/edit")
+    def image_save(image_id: int):
+        old = get_image(image_id)
+        values, error = image_form()
+        if error:
+            return render_image_form(dict(values, id=image_id, _typed=True), error, 400)
+        with db.transaction() as conn:
+            conn.execute("UPDATE images SET name = ?, image = ?, version = ?, track = ?, "
+                         "location = ? WHERE id = ?",
+                         (values["name"], values["image"], values["version"], values["track"],
+                          values["location"], image_id))
+            if any(old[k] != values[k] for k in ("image", "version", "track")):
+                # Something else is watched now: start over
+                conn.execute("UPDATE images SET digest = '', latest = '', newer = '[]', "
+                             "found = NULL, error = '', checked = NULL WHERE id = ?", (image_id,))
+        monitor.check_image_soon(image_id)
+        flash("Image saved.")
+        return redirect(url_for("docker_page") + f"#image-{image_id}")
+
+    @app.post("/docker/<int:image_id>/check")
+    def image_check(image_id: int):
+        get_image(image_id)
+        monitor.check_image_soon(image_id)
+        flash("Checking now. The result shows up within a few seconds.")
+        return redirect(url_for("docker_page") + f"#image-{image_id}")
+
+    @app.post("/docker/check")
+    def images_check():
+        for row in db.all("SELECT id FROM images"):
+            monitor.check_image_soon(row["id"])
+        flash("Checking all images now. The results show up within a minute.")
+        return redirect(url_for("docker_page"))
+
+    @app.post("/docker/<int:image_id>/confirm")
+    def image_confirm(image_id: int):
+        img = get_image(image_id)
+        version = request.form.get("version", "").strip()[:128]
+        if not monitor.confirm_image(image_id, version):
+            flash("Nothing to confirm: the newer version is no longer listed. Check again "
+                  "or set the version under Edit.", "error")
+            return redirect(url_for("docker_page") + f"#image-{image_id}")
+        log.info("Docker image %s updated", img["name"])
+        new = get_image(image_id)
+        flash(f"{img['name']}: noted that you run the new image of {img['version']}."
+              if img["track"] == "digest" else f"{img['name']}: noted that you run {version}."
+              + (f" {new['latest']} is newer still." if new["latest"] else ""))
+        monitor.check_image_soon(image_id)
+        return redirect(url_for("docker_page") + f"#image-{image_id}")
+
+    @app.post("/docker/<int:image_id>/mute")
+    def image_mute(image_id: int):
+        img = get_image(image_id)
+        db.execute("UPDATE images SET muted = ? WHERE id = ?",
+                   (0 if img["muted"] else 1, image_id))
+        flash("Notifications for this image are on again." if img["muted"] else
+              "Muted: new versions still show up here, but no notifications are sent.")
+        return redirect(url_for("docker_page") + f"#image-{image_id}")
+
+    @app.post("/docker/<int:image_id>/delete")
+    def image_delete(image_id: int):
+        img = get_image(image_id)
+        db.execute("DELETE FROM images WHERE id = ?", (image_id,))
+        log.info("Docker image %s removed", img["name"])
+        flash(f"{img['name']} is no longer watched.")
+        return redirect(url_for("docker_page"))
+
+    @app.post("/docker/settings")
+    def docker_settings():
+        hours = form_int("docker_check_hours", 0, 24)
+        if hours not in IMAGE_CHECK_HOURS:
+            abort(400, "Choose how often to check from the list.")
+        db.set_setting("docker_check_hours", hours)
+        flash(f"Docker images are checked {IMAGE_CHECK_HOURS[hours]}.")
+        return redirect(url_for("docker_page") + "#docker-settings")
+
     @app.get("/report")
     def report_page():
         return render_template(
@@ -3791,7 +4829,7 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         monitor.request_scan()
         flash("Agents will check their drives within a minute.")
         back = request.form.get("back", "")
-        return redirect(back if LOCAL_PATH.match(back) else url_for("overview"))
+        return redirect(back if LOCAL_PATH.match(back) else url_for("drives_page"))
 
     @app.post("/notify/test")
     def notify_test():

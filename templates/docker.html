@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}Docker{% endblock %}
+{% block content %}
+<p class="date">Docker images</p>
+<h1 class="headline">{% if not images %}No images are watched yet.{% elif counts.available %}{{ counts.available }} of {{ images|length }} image{{ 's' if images|length != 1 }} can be updated.{% elif counts.error %}{{ counts.error }} image{{ 's' if counts.error != 1 }} could not be checked.{% elif counts.pending %}Checking…{% else %}All images are up to date.{% endif %}</h1>
+
+<div class="tiles four">
+  <div class="tile"><div class="label">Watched</div><div class="value">{{ images|length }}</div><div class="sub">image{{ 's' if images|length != 1 }}</div></div>
+  <div class="tile"><div class="label">Updates</div><div class="value {{ 'warn' if counts.available else 'ok' }}">{{ counts.available }}</div><div class="sub">{{ 'update by hand, then confirm it here' if counts.available else 'nothing to do' }}</div></div>
+  <div class="tile"><div class="label">Errors</div><div class="value {{ 'crit' if counts.error }}">{{ counts.error }}</div><div class="sub">{{ 'registry not reachable or image unknown' if counts.error else 'none' }}</div></div>
+  <div class="tile"><div class="label">Checked</div><div class="value">{{ hours ~ ' h' if hours else 'by hand' }}</div><div class="sub">{{ check_hours[hours] }}</div></div>
+</div>
+
+<div class="panel">
+  <div class="panel-head">
+    <h2>Images</h2>
+    <div class="actions">
+      {% if images %}
+      <form class="inline" method="post" action="{{ url_for('images_check') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="btn" type="submit">Check all</button>
+      </form>
+      {% endif %}
+      <a class="btn primary" href="{{ url_for('image_new') }}">Add an image</a>
+    </div>
+  </div>
+  {% for i in images %}
+  {% set cls = {'available': 'watch', 'error': 'failing', 'current': 'healthy'}.get(i.state, '') %}
+  <section class="image-item" id="image-{{ i.id }}">
+    <div class="image-head">
+      <div>
+        <span class="badge {{ cls }}"><span class="dot {{ cls or 'missing' }}"></span>{{ {'available': 'update', 'error': 'error', 'current': 'up to date', 'pending': 'waiting'}[i.state] }}</span>
+        <b class="image-name">{{ i.name }}</b>
+        <div class="target"><span class="mono">{{ i.display }}:{{ i.version }}</span> · {{ i.track_label }}{% if i.muted %} · notifications muted{% endif %}</div>
+        {% if i.location %}<div class="target">Runs in <span class="mono">{{ i.location }}</span></div>{% endif %}
+      </div>
+      <div class="actions">
+        <form class="inline" method="post" action="{{ url_for('image_check', image_id=i.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="btn small" type="submit" {{ 'disabled' if i.checking }}>{{ 'Checking…' if i.checking else 'Check' }}</button>
+        </form>
+        <a class="btn small" href="{{ url_for('image_edit', image_id=i.id) }}">Edit</a>
+        <form class="inline" method="post" action="{{ url_for('image_mute', image_id=i.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="btn small" type="submit">{{ 'Unmute' if i.muted else 'Mute' }}</button>
+        </form>
+      </div>
+    </div>
+    {% if i.error %}<p class="small crit">{{ i.error }}</p>{% endif %}
+    {% if i.latest %}
+    <div class="callout watch"><span class="dot warn"></span><div>
+      <b>{{ update_text(i) }}</b>{% if i.found %} <span class="quiet small">· since {{ i.found|time }}</span>{% endif %}
+      {% if i.track == 'digest' %}
+      <p>New image: <span class="mono">{{ i.latest[:19] }}…</span>. Update it by hand{% if i.location %} in <span class="mono">{{ i.location }}</span>{% endif %}: <span class="mono">docker compose pull</span>, then <span class="mono">docker compose up -d</span>. Then confirm it here.</p>
+      {% else %}
+      <p>Newer: {% for v in i.newer[:8] %}<span class="mono">{{ v }}</span>{{ ', ' if not loop.last }}{% endfor %}{% if i.newer|length > 8 %} and {{ i.newer|length - 8 }} more{% endif %}. Update it by hand{% if i.location %} in <span class="mono">{{ i.location }}</span>{% endif %}: change the version in your compose file, then <span class="mono">docker compose pull</span> and <span class="mono">docker compose up -d</span>. Read the release notes first for a new major version. Then confirm it here.</p>
+      {% endif %}
+      <form class="confirm-update" method="post" action="{{ url_for('image_confirm', image_id=i.id) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {% if i.track == 'digest' %}
+        <input type="hidden" name="version" value="{{ i.version }}">
+        <button class="btn small primary" type="submit">I updated it</button>
+        {% else %}
+        <label for="v-{{ i.id }}">I updated to</label>
+        <select id="v-{{ i.id }}" name="version">{% for v in i.newer %}<option value="{{ v }}">{{ v }}</option>{% endfor %}</select>
+        <button class="btn small primary" type="submit">Confirm</button>
+        {% endif %}
+      </form>
+    </div></div>
+    {% endif %}
+    <div class="small quiet">{% if i.checking %}checking now{% elif i.checked %}checked {{ i.checked|ago }}{% else %}waiting for the first check{% endif %}</div>
+  </section>
+  {% else %}
+  <p class="empty">Add the images your containers run, with the version you run and what counts as an update. mimamori asks their registry for newer versions and shows them here and on the overview. You update by hand and confirm it here; nothing on your hosts is changed.</p>
+  {% endfor %}
+</div>
+
+<div class="panel" id="docker-settings">
+  <h2>How often</h2>
+  <form class="row" method="post" action="{{ url_for('docker_settings') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="field"><label for="d-hours">Ask the registries</label>
+      <select id="d-hours" name="docker_check_hours">{% for h, label in check_hours.items() %}<option value="{{ h }}" {{ 'selected' if h == hours }}>{{ label }}</option>{% endfor %}</select></div>
+    <div class="field"><button class="btn" type="submit">Save</button></div>
+  </form>
+  <p class="quiet small">The server asks the registry of each image (Docker Hub, GitHub, Quay, your own registry over HTTPS) which tags exist; for a followed tag such as <span class="mono">latest</span> only which image it points to, which does not count as a pull on Docker Hub. Only public images work: mimamori stores no registry passwords. The agents are not involved. Who gets a notification is set in <a href="{{ url_for('settings') }}#notifications">Settings → Notifications</a> (off by default).</p>
+</div>
+{% endblock %}

@@ -2,7 +2,11 @@
 {% from "_macros.html" import alert_dot, alert_kind %}
 {% block title %}Alerts{% endblock %}
 {% block content %}
-<h1 class="headline">Alerts</h1>
+{# The weekly report lives with the alerts: both are what mimamori sends #}
+<div class="page-head">
+  <h1 class="headline">Alerts</h1>
+  <div class="actions"><a class="btn" href="{{ url_for('report_page') }}">Weekly report</a></div>
+</div>
 <div class="panel">
   <ul class="alert-list">
     {% for a in alerts %}
@@ -10,7 +14,7 @@
       {{ alert_dot(a) }}
       <div>
         {{ alert_kind(a) }}
-        <div class="alert-title">{% if a.drive_id %}<a href="{{ url_for('drive', drive_id=a.drive_id) }}">{{ a.title }}</a>{% elif a.monitor_id %}<a href="{{ url_for('monitor_page', monitor_id=a.monitor_id) }}">{{ a.title }}</a>{% elif a.kind == 'updates' and a.agent_id %}<a href="{{ url_for('host', agent_id=a.agent_id) }}">{{ a.title }}</a>{% else %}{{ a.title }}{% endif %}</div>
+        <div class="alert-title">{% if a.drive_id %}<a href="{{ url_for('drive', drive_id=a.drive_id) }}">{{ a.title }}</a>{% elif a.monitor_id %}<a href="{{ url_for('monitor_page', monitor_id=a.monitor_id) }}">{{ a.title }}</a>{% elif a.heartbeat_id %}<a href="{{ url_for('push_page', heartbeat_id=a.heartbeat_id) }}">{{ a.title }}</a>{% elif a.image_id %}<a href="{{ url_for('docker_page') }}#image-{{ a.image_id }}">{{ a.title }}</a>{% elif a.kind == 'updates' and a.agent_id %}<a href="{{ url_for('host', agent_id=a.agent_id) }}">{{ a.title }}</a>{% else %}{{ a.title }}{% endif %}</div>
         {% if a.detail %}<div class="quiet small">{{ a.detail }}</div>{% endif %}
         <div class="alert-meta">{% if a.host %}{{ a.host }} · {% endif %}{{ a.ts|time }} · {{ 'sent to ' ~ a.channels if a.channels else 'not sent' }}</div>
       </div>

@@ -10,7 +10,7 @@
 {%- endmacro %}
 {% macro lvl(key) %}{{ d.issues[key].level if key in d.issues else '' }}{% endmacro %}
 {% block content %}
-<a class="back" href="{{ url_for('overview') }}">← All drives</a>
+<a class="back" href="{{ url_for('drives_page') }}">← All drives</a>
 <div>{{ badge(d.status) }}</div>
 <div class="drive-head">
   <div>

@@ -8,11 +8,11 @@
 
 {# Updates and firmware are gold, whatever their rank; red stays with failing drives #}
 {% macro alert_tone(a) -%}
-{%- if a.kind in ('missing', 'agent_offline') %}quiet{% elif a.kind in ('updates', 'firmware') %}{{ 'quiet' if a.level == 'info' else 'warn' }}{% else %}{{ {'crit': 'crit', 'warn': 'warn', 'ok': 'ok'}.get(a.level, 'quiet') }}{% endif -%}
+{%- if a.kind in ('missing', 'agent_offline') %}quiet{% elif a.kind in ('push_fail', 'push_late') %}crit{% elif a.kind in ('updates', 'firmware', 'docker') %}{{ 'quiet' if a.level == 'info' else 'warn' }}{% else %}{{ {'crit': 'crit', 'warn': 'warn', 'ok': 'ok'}.get(a.level, 'quiet') }}{% endif -%}
 {%- endmacro %}
 
 {% macro alert_kind(a) -%}
-<span class="alert-kind {{ alert_tone(a) }}">{{ {'new_issue': 'New issue', 'worsened': 'Worsened', 'resolved': 'Resolved', 'missing': 'Missing', 'back': 'Back', 'agent_offline': 'Agent offline', 'agent_online': 'Agent online', 'updates': 'Security update', 'firmware': 'Firmware', 'storage': 'Disk space', 'monitor_down': 'Down', 'monitor_up': 'Up', 'monitor_tls': 'Certificate'}.get(a.kind, a.kind) }}</span>
+<span class="alert-kind {{ alert_tone(a) }}">{{ {'new_issue': 'New issue', 'worsened': 'Worsened', 'resolved': 'Resolved', 'missing': 'Missing', 'back': 'Back', 'agent_offline': 'Agent offline', 'agent_online': 'Agent online', 'updates': 'Security update', 'firmware': 'Firmware', 'storage': 'Disk space', 'monitor_down': 'Down', 'monitor_up': 'Up', 'monitor_tls': 'Certificate', 'docker': 'Docker image', 'push_fail': 'Failed', 'push_late': 'Overdue', 'push_ok': 'Back'}.get(a.kind, a.kind) }}</span>
 {%- endmacro %}
 
 {% macro alert_dot(a) -%}
@@ -90,6 +90,12 @@
 {% macro monitor_badge(m) -%}
 {%- set cls = {'up': 'healthy', 'down': 'failing'}.get(m.state, '') -%}
 <span class="badge {{ cls }}"><span class="dot {{ cls or 'missing' }}"></span>{{ m.state }}</span>
+{%- endmacro %}
+
+{# Push checks #}
+{% macro push_badge(h) -%}
+{%- set cls = {'up': 'healthy', 'failed': 'failing', 'late': 'failing'}.get(h.state, '') -%}
+<span class="badge {{ cls }}"><span class="dot {{ cls or 'missing' }}"></span>{{ {'up': 'ok', 'failed': 'failed', 'late': 'overdue', 'new': 'new', 'paused': 'paused'}.get(h.state, h.state) }}</span>
 {%- endmacro %}
 
 {% macro beats_bar(beats) -%}

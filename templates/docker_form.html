@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Edit ' ~ i.name if i.id else 'Add an image' }}{% endblock %}
+{% block content %}
+<a class="back" href="{{ url_for('docker_page') }}">← All images</a>
+<h1 class="headline">{{ 'Edit ' ~ i.name if i.id else 'Add an image' }}</h1>
+
+<div class="panel form-panel">
+  <form method="post" action="{{ url_for('image_save', image_id=i.id) if i.id else url_for('image_create') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div class="field wide"><label for="i-image">Image</label><input id="i-image" name="image" value="{{ i.image }}" maxlength="255" placeholder="nginx, linuxserver/sonarr or ghcr.io/owner/app" required autocomplete="off" spellcheck="false"></div>
+      <div class="field"><label for="i-version">Version you run</label><input id="i-version" name="version" value="{{ i.version }}" maxlength="128" placeholder="1.27.2 or latest" autocomplete="off" spellcheck="false"></div>
+    </div>
+    <p class="quiet small hint">As in the <span class="mono">image:</span> line of your compose file. <span class="mono">nginx:1.27.2</span> in the image field works too.</p>
+    <div class="field">
+      <label>What counts as an update</label>
+      <div class="track-pick">
+        {% for key, label in tracks.items() %}
+        <label class="check"><input type="radio" name="track" value="{{ key }}" {{ 'checked' if i.track == key }}> {{ label }}</label>
+        {% endfor %}
+      </div>
+      <p class="quiet small hint">Only tags of the same form count: after <span class="mono">1.27.2-alpine</span> comes <span class="mono">1.27.3-alpine</span>, not <span class="mono">1.27.3</span>. For a tag that moves, such as <span class="mono">latest</span> or <span class="mono">beta</span>, choose the last option: the image the tag points to at the first check counts as the one you run.</p>
+    </div>
+    <div class="row">
+      <div class="field"><label for="i-name">Name</label><input id="i-name" name="name" value="{{ i.name }}" maxlength="48" placeholder="the image's name"></div>
+      <div class="field wide"><label for="i-location">Where it runs (optional)</label><input id="i-location" name="location" value="{{ i.location }}" maxlength="200" placeholder="/opt/stacks/nextcloud/docker-compose.yml on nas" autocomplete="off" spellcheck="false"></div>
+    </div>
+    <p class="quiet small">mimamori only asks the image's registry; it never changes anything on your hosts. Public images only, over HTTPS.</p>
+    <button class="btn primary" type="submit">{{ 'Save' if i.id else 'Add and check now' }}</button>
+  </form>
+</div>
+
+{% if i.id %}
+<div class="panel form-panel">
+  <details class="confirm">
+    <summary class="btn small danger">Remove…</summary>
+    <form class="confirm-box" method="post" action="{{ url_for('image_delete', image_id=i.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn small danger" type="submit">Stop watching this image</button>
+    </form>
+  </details>
+</div>
+{% endif %}
+{% endblock %}

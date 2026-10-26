@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% from "_macros.html" import usage %}
+{% block title %}Systems{% endblock %}
+{% block content %}
+<p class="date">Systems</p>
+<h1 class="headline">{% if not agents %}No hosts yet.{% elif not sys.reported %}No host reports its packages yet.{% elif not sys.enabled %}The update check is off.{% elif sys.update_total %}{{ sys.update_total }} security update{{ 's' if sys.update_total != 1 }} missing.{% elif sys.reboot %}Up to date, {{ sys.reboot }} host{{ 's' if sys.reboot != 1 }} to reboot.{% else %}All systems are up to date.{% endif %}</h1>
+
+{% if agents and not sys.enabled %}
+<div class="banner">The check for missing security updates is off. Turn it on in <a href="{{ url_for('settings') }}#updates">Settings → Updates</a> to compare the hosts' packages with the OSV vulnerability database.</div>
+{% endif %}
+
+<div class="tiles four">
+  <div class="tile"><div class="label">Hosts</div><div class="value">{{ agents|length }}</div>
+    <div class="sub">{{ sys.reported }} report{{ 's' if sys.reported == 1 }} their packages</div></div>
+  <div class="tile"><div class="label">Missing security updates</div><div class="value {{ 'warn' if sys.update_total else 'ok' if sys.reported }}">{{ sys.update_total }}</div>
+    <div class="sub">{{ sys.updates.high }} critical · {{ sys.updates.middle }} medium · {{ sys.updates.low }} low</div></div>
+  <div class="tile"><div class="label">Reboot needed</div><div class="value {{ 'warn' if sys.reboot }}">{{ sys.reboot }}</div>
+    <div class="sub">a newer kernel is installed than runs</div></div>
+  <div class="tile"><div class="label">Disk space</div><div class="value {{ 'warn' if sys.storage else 'ok' if agents|selectattr('fullest')|list }}">{{ sys.storage }}</div>
+    <div class="sub">filesystem{{ 's' if sys.storage != 1 }} filling up or almost full</div></div>
+</div>
+
+<div class="system-grid">
+{% for a in agents %}
+{% set level = 'crit' if a.fullest and a.fullest.level == 'crit' else 'warn' if a.update_counts.high or a.update_counts.middle or a.os.reboot or (a.fullest and a.fullest.level) else '' %}
+<section class="panel system tone-{{ level or 'ok' }}">
+  <div class="system-head">
+    <h2><a class="host-link" href="{{ url_for('host', agent_id=a.id) }}">{{ a.name }}</a>{% if a.location %}<span class="location">{{ a.location }}</span>{% endif %}</h2>
+    <span class="presence"><span class="dot {{ 'on' if a.online else 'crit' }}"></span>{% if a.online %}online{% elif a.last_seen %}offline · {{ a.last_seen|ago }}{% else %}not connected{% endif %}</span>
+  </div>
+  <dl class="facts">
+    <dt>System</dt><dd>{{ a.os.name or 'not reported' }}</dd>
+    {% if a.os.kernel %}<dt>Kernel</dt><dd><span class="mono">{{ a.os.kernel }}</span>{% if a.os.reboot %}<div class="warn small">reboot to run {{ a.os.reboot }}</div>{% endif %}</dd>{% endif %}
+    <dt>Security updates</dt><dd>
+      {% if not a.os %}<span class="quiet">packages not reported</span>
+      {% elif a.update_progress is not none %}checking · {{ a.update_progress }} %
+      {% elif a.update_queued %}<span class="quiet">check starts within a minute</span>
+      {% elif a.update_total %}<span class="{{ 'warn' if a.update_counts.high or a.update_counts.middle else 'quiet' }}">{{ a.update_total }} missing</span> <span class="quiet small">({% for lvl in ['high', 'middle', 'low'] if a.update_counts[lvl] %}{{ a.update_counts[lvl] }} {{ lvl|sev }}{{ ', ' if not loop.last }}{% endfor %})</span>
+      {% elif a.updates_checked %}<span class="ok">none missing</span>
+      {% else %}<span class="quiet">{{ 'not checked yet' if sys.enabled else 'check is off' }}</span>{% endif %}</dd>
+    {% if a.firmware_issues %}<dt>Drive firmware</dt><dd><span class="warn">{{ a.firmware_issues }} update{{ 's' if a.firmware_issues != 1 }} recommended</span></dd>{% endif %}
+    <dt>Agent</dt><dd>{{ a.agent_version or '–' }}{% if a.last_report %} <span class="quiet small">· reported {{ a.last_report|ago }}</span>{% endif %}</dd>
+  </dl>
+  {% if a.filesystems %}
+  <div class="system-fs">
+    {% for f in a.filesystems|sort(attribute='percent', reverse=true) %}{% if loop.index <= 4 %}{{ usage(f) }}{% endif %}{% endfor %}
+    {% if a.filesystems|length > 4 %}<div class="quiet small">and {{ a.filesystems|length - 4 }} more</div>{% endif %}
+  </div>
+  {% else %}
+  <p class="quiet small">Disk space not reported.</p>
+  {% endif %}
+  <a class="small" href="{{ url_for('host', agent_id=a.id) }}">Packages, updates and disk space →</a>
+</section>
+{% else %}
+<div class="panel">
+  <p class="empty">Hosts show up here once their agent reports. <a href="{{ url_for('settings') }}#agents">Add an agent</a>.</p>
+</div>
+{% endfor %}
+</div>
+<p class="quiet small">Hosts report their packages when the agent can read the package list (see <span class="mono">volumes</span> in docker-compose.agent.yml), and their disk space when folders are mounted under <span class="mono">/host/fs</span>. "Filling up" from {{ fs_limits.warn }} %, "almost full" from {{ fs_limits.crit }} %.</p>
+{% endblock %}

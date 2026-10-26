@@ -18,6 +18,8 @@ A server container runs behind your reverse proxy, and a small agent container o
 - **Thresholds you set**, per drive type or per drive. A reallocated or pending sector means *Watch*, a growing count *Failing*
 - **Disk space** of the host's filesystems, matched to their drives, with a trend and a warning before one is full
 - **Status monitor**: the server checks your websites (HTTP and HTTPS with their certificate), TCP ports and hosts by ping, and tells you when one stops answering
+- **Backups and jobs**: Backrest, cron jobs and scripts report each run to a secret URL; mimamori tells you when one fails or does not run in time
+- **Docker images**: the server asks Docker Hub, GHCR and other registries whether a newer version of the images you run exists, and you confirm on the page once you updated by hand
 - **Missing updates**: drive firmware with a known bug, and missing security updates of Debian, Ubuntu and Alpine hosts ([details](docs/updates.md))
 - **Notifications** to Discord, mail and your own webhook, chosen per channel, plus a weekly report
 - **Small, safe agents**: about 30 MB of memory and next to no CPU, no open port, end-to-end encrypted, the network part runs without any privilege ([details](SECURITY.md#how-mimamori-is-secured))
@@ -79,6 +81,28 @@ A few remapped sectors on an old drive can stay stable for years, a count that k
 | **Ping** | The host answers an ICMP echo request |
 
 A check counts as down after a number of failed checks in a row (2 by default), so one lost packet does not wake you up. Who gets told about down, back up and expiring certificates is chosen in **Settings → Notifications**, like everything else. The checks run on the server and see the network as it does: addresses in your home network work, loopback, link-local (`169.254.x.x`, cloud metadata) and multicast addresses are never checked, and redirects are not followed.
+
+**Backups and jobs**, also on the Status page, are the other way round: the job reports to mimamori. Add one with **Add a backup or job**, say how often it runs and how late it may be, and copy the secret URL that is shown once. The job then sends a POST to it, in the same way as for healthchecks.io:
+
+| Request | Means |
+|---|---|
+| `POST <url>` or `<url>/0` | the run succeeded |
+| `POST <url>/start` | a run began |
+| `POST <url>/fail` or `<url>/<exit code>` | the run failed |
+| `POST <url>/log` | a note, changes nothing |
+
+For **Backrest**, add a hook of the type *Healthchecks* to the plan with this URL, for the conditions `CONDITION_SNAPSHOT_START`, `CONDITION_SNAPSHOT_SUCCESS` and `CONDITION_SNAPSHOT_ERROR`. For a script: `curl -fsS -m 10 --retry 3 -X POST <url>/$?` at its end. A failure is reported at once, a missing success once the interval plus the allowed delay has passed since the last one, which also catches a job that never started. The text in the request body (e.g. Backrest's summary) shows up on the page and in the alert.
+
+**Docker** lists the images your containers run. Add one with **Add an image**: the image as in your compose file (`nginx`, `linuxserver/sonarr`, `ghcr.io/owner/app`), the version you run, and what counts as an update:
+
+| Choice | Example | You are told about |
+|---|---|---|
+| **Newer stable versions** | `1.27.2` | `1.27.3`, `1.28.0`, `2.0.0` |
+| **Same major version** | `16.4` (PostgreSQL) | `16.5`, but not `17.0`, which needs a migration |
+| **Betas included** | `0.3.2` | `0.3.3-beta.1` as well |
+| **This tag** | `latest`, `beta` | the tag pointing to a new image (e.g. a rebuild with security fixes) |
+
+Only tags of the same form count: after `1.27.2-alpine` comes `1.27.3-alpine`. A new version shows up on the overview (and, if you turn it on under **Settings → Notifications**, in your channels). Update the container by hand, e.g. `docker compose pull && docker compose up -d`, then click **Confirm** with the version you now run. The server asks the registries every 12 hours by default, or only when you click **Check**. It never changes anything on your hosts, and the agents are not involved. Only public images work: mimamori stores no registry passwords.
 
 If something does not work, see [Troubleshooting](docs/troubleshooting.md).
 

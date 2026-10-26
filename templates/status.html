@@ -1,9 +1,9 @@
 {% extends "base.html" %}
-{% from "_macros.html" import monitor_badge, beats_bar, percent %}
+{% from "_macros.html" import monitor_badge, push_badge, beats_bar, percent %}
 {% block title %}Status{% endblock %}
 {% block content %}
 <p class="date">Status monitor</p>
-<h1 class="headline">{% if not monitors %}Nothing is watched yet.{% elif counts.down %}{{ counts.down }} of {{ monitors|length }} {{ 'does' if counts.down == 1 else 'do' }} not answer.{% elif counts.up == monitors|length %}Everything answers.{% else %}{{ counts.up }} of {{ monitors|length }} answer.{% endif %}</h1>
+<h1 class="headline">{% if not monitors and not pushes %}Nothing is watched yet.{% elif push_problems and not counts.down %}{{ push_problems }} backup{{ 's' if push_problems != 1 }} or job{{ 's' if push_problems != 1 }} need{{ 's' if push_problems == 1 }} attention.{% elif not monitors %}All backups and jobs ran in time.{% elif counts.down %}{{ counts.down }} of {{ monitors|length }} {{ 'does' if counts.down == 1 else 'do' }} not answer.{% elif counts.up == monitors|length %}Everything answers.{% else %}{{ counts.up }} of {{ monitors|length }} answer.{% endif %}</h1>
 
 <div class="tiles four">
   <div class="tile"><div class="label">Up</div><div class="value ok">{{ counts.up }}</div><div class="sub">answering as expected</div></div>
@@ -58,6 +58,34 @@
   </div>
   {% else %}
   <p class="empty">mimamori can check websites (HTTP and HTTPS, with their certificate), TCP ports and hosts by ping, and tell you through the channels in <a href="{{ url_for('settings') }}#notifications">Settings → Notifications</a> when one stops answering.</p>
+  {% endif %}
+</div>
+<div class="panel" id="push">
+  <div class="panel-head">
+    <h2>Backups and jobs</h2>
+    <a class="btn primary" href="{{ url_for('push_new') }}">Add a backup or job</a>
+  </div>
+  {% if pushes %}
+  <div class="table-wrap">
+  <table class="status-table">
+    <thead><tr><th>Status</th><th>Job</th><th>Last success</th><th>Overdue at</th><th>Last ping</th></tr></thead>
+    <tbody>
+    {% for h in pushes %}
+    <tr>
+      <td>{{ push_badge(h) }}</td>
+      <td><a href="{{ url_for('push_page', heartbeat_id=h.id) }}">{{ h.name }}</a>
+        <div class="target">every {{ h.interval_label }}{% if h.running %} · running since {{ h.running|time(false) }}{% endif %}{% if h.muted %} · muted{% endif %}</div>
+        {% if h.state == 'failed' and h.last_message %}<div class="small crit push-message">{{ h.last_message[:160] }}</div>{% endif %}</td>
+      <td class="small nowrap">{{ h.last_success|ago if h.last_success else 'none yet' }}</td>
+      <td class="small nowrap {{ 'crit' if h.state == 'late' }}">{{ h.deadline|time if not h.paused else '–' }}</td>
+      <td class="small quiet nowrap">{{ h.last_ping|ago }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="empty">A backup (e.g. Backrest), a cron job or any script calls a secret URL of mimamori when it ran. mimamori tells you when one reports a failure, or when no success comes in time.</p>
   {% endif %}
 </div>
 <p class="quiet small">The checks run on the mimamori server, so they see the network as the server does. Addresses in your home network work; loopback, link-local (169.254.x.x) and multicast addresses are never checked. Redirects are not followed: a 301 or 302 counts as its own status code.</p>
