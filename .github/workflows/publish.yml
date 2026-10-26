@@ -94,7 +94,8 @@ jobs:
       # rebuild must not stop bringing fixes because one package has no update yet.
       # trivy-action had its tags replaced by malicious code in March 2026 (GHSA-69fq-xp46-6x23):
       # pinned to the commit of the immutable release v0.36.0, and Trivy itself to a fixed version.
-      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+      - name: "Trivy: all findings (for reading, never fails)"
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ghcr.io/pascal2108/${{ matrix.image }}@${{ steps.build.outputs.digest }}
           version: v0.76.1
@@ -102,7 +103,8 @@ jobs:
           format: table
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
           exit-code: "0"
-      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+      - name: "Trivy: fail on high or critical with a fix"
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ghcr.io/pascal2108/${{ matrix.image }}@${{ steps.build.outputs.digest }}
           version: v0.76.1
