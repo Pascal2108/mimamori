@@ -2,38 +2,44 @@
 
 # mimamori 見守り
 
-A self-hosted **drive health monitor**. It watches the SMART data of the drives on all your hosts, keeps their history and tells you when a drive starts to fail, before it takes your data with it. *Mimamori* is Japanese for "watching over".
+A self-hosted **monitor for your hosts and services**. One page shows what needs you: failing drives, missing security updates, full disks, websites that stop answering, backups that failed or did not run, and Docker images with a newer version. *Mimamori* is Japanese for "watching over".
 
 <br clear="left">
 
 > **Beta:** every version below 1.0 is a beta. mimamori works and is used every day, but settings and pages may still change between versions. Read the release notes before you update.
 
-A server container runs behind your reverse proxy, and a small agent container on every host whose drives you want to watch.
+A server container runs behind your reverse proxy. A small agent container on each host reports its drives, packages and disk space. Status checks, backups and Docker images need no agent: the server checks them itself, or the job reports to it.
 
-![mimamori on a desktop: eight drives on two hosts, one failing with rising reallocated sectors, one to watch and one missing](docs/screenshots/desktop.png)
+![mimamori on a desktop: the overview with drives, systems, Docker images, status checks and recent alerts of two hosts](docs/screenshots/desktop.png)
 
-## Features
+## What it watches
 
-<img src="docs/screenshots/phone.png" alt="mimamori on a phone: compact list of all drives with status and temperature" width="240" align="right">
+<img src="docs/screenshots/phone.png" alt="mimamori on a phone: the overview with the drives and systems that need attention" width="240" align="right">
 
-- **Every drive on one page**: status, temperature, power-on hours, wear and sector counts, grouped by host, with a history of up to a year
-- **Thresholds you set**, per drive type or per drive. A reallocated or pending sector means *Watch*, a growing count *Failing*
-- **Disk space** of the host's filesystems, matched to their drives, with a trend and a warning before one is full
-- **Status monitor**: the server checks your websites (HTTP and HTTPS with their certificate), TCP ports and hosts by ping, and tells you when one stops answering
+- **Drives**: SMART data of every drive on every host, with temperature, power-on hours, wear and sector counts, a history of up to a year and thresholds you set per drive type or per drive. A reallocated or pending sector means *Watch*, a growing count *Failing*
+- **Systems**: missing security updates of Debian, Ubuntu and Alpine hosts, a pending reboot after a kernel update, drive firmware with a known bug ([details](docs/updates.md)), and how full each filesystem is, with a trend and a warning before it is full
+- **Sites and services**: the server checks websites (HTTP and HTTPS, with their certificate), TCP ports and hosts by ping, and tells you when one stops answering or a certificate is about to expire
 - **Backups and jobs**: Backrest, cron jobs and scripts report each run to a secret URL; mimamori tells you when one fails or does not run in time
-- **Docker images**: the server asks Docker Hub, GHCR and other registries whether a newer version of the images you run exists, and you confirm on the page once you updated by hand
-- **Missing updates**: drive firmware with a known bug, and missing security updates of Debian, Ubuntu and Alpine hosts ([details](docs/updates.md))
-- **Notifications** to Discord, mail and your own webhook, chosen per channel, plus a weekly report
+- **Docker images**: the server asks Docker Hub, GHCR and other registries whether a newer version of the images you run exists. You update by hand and confirm on the page
+- **Notifications** to Discord, mail and your own webhook, chosen per channel and topic, plus a weekly report
+- **Read-only API** for dashboards and scripts, and a [Home Assistant integration](https://github.com/Pascal2108/mimamori-homeassistant) ([API](docs/api.md))
 - **Small, safe agents**: about 30 MB of memory and next to no CPU, no open port, end-to-end encrypted, the network part runs without any privilege ([details](SECURITY.md#how-mimamori-is-secured))
 - **No JavaScript, nothing loaded from other servers**
 
-The screenshots show made-up drives.
-
 <br clear="right">
+
+| | |
+|---|---|
+| ![A failing drive: 312 reallocated sectors, charts of temperature and sector counts over 30 days](docs/screenshots/drive.png) | ![A host: disk space per filesystem with a trend, missing security updates and drive firmware](docs/screenshots/host.png) |
+| **A drive**: history, SMART table, thresholds | **A host**: disk space, security updates, firmware |
+| ![The status monitor: six sites and services with uptime and response times, three backups and jobs](docs/screenshots/status.png) | ![Docker images: two with a newer version, confirmed by hand after the update](docs/screenshots/docker.png) |
+| **Status**: sites, services, backups and jobs | **Docker**: images with a newer version |
+
+The screenshots show made-up hosts, drives and updates.
 
 ## Getting started
 
-You need Docker with Docker Compose, a reverse proxy that provides HTTPS (e.g. Nginx Proxy Manager), and on every host to watch, its drives as `/dev/sd…` or `/dev/nvme…`.
+You need Docker with Docker Compose and a reverse proxy that provides HTTPS (e.g. Nginx Proxy Manager). For the drives of a host, they must be visible to it as `/dev/sd…` or `/dev/nvme…`.
 
 ### 1. Server
 
@@ -48,22 +54,28 @@ cp secrets.env.example secrets.env
 3. Start it: `docker compose up -d`. The log (`docker compose logs -f`) shows `mimamori … started`.
 4. In your reverse proxy, add a host that forwards to `http://mimamori:8000`, with a certificate and **Force SSL**. The server publishes no port of its own, so all traffic goes through the proxy. Use exactly one proxy: the login lockout relies on the address it reports.
 
+Status checks, backups and Docker images work from here on. Add them on the **Status** and **Docker** pages ([see below](#using-it)).
+
 ### 2. Agents
 
-On every host with drives to watch, including the server's host if it has some:
+On every host to watch, including the server's host:
 
 1. On the page, open **Settings → Agents**, enter the host's name and click **Create agent key**. The key is shown only once.
 2. Copy `docker-compose.agent.yml` and `agent.env.example` to the host, rename the latter to `agent.env` and fill in `SERVER_URL` (the HTTPS address of mimamori) and `AGENT_KEY`. Then `chmod 600 agent.env`.
 3. In `docker-compose.agent.yml`, set `AGENT_NAME` and list the drives under `devices` (`ls /dev/sd? /dev/nvme?`), each as `/dev/sdb:/dev/sdb:r`, so the container can only read them. Without NVMe drives, remove the line `- SYS_ADMIN`.
-4. Start it: `docker compose -f docker-compose.agent.yml up -d`. The log shows `Reported … device(s)`, and the drives appear on the page within a minute.
+4. Start it: `docker compose -f docker-compose.agent.yml up -d`. The log shows `Reported … device(s)`, and the host appears on the page within a minute.
 
-**Optional:** to have the host checked for missing security updates, remove the `#` in front of its `volumes:` lines in `docker-compose.agent.yml`, recreate the agent, and turn the check on under **Settings → Updates** ([details](docs/updates.md)).
+**Security updates (optional):** remove the `#` in front of the host's package list lines under `volumes:` in `docker-compose.agent.yml`, recreate the agent, and turn the check on under **Settings → Updates** ([details](docs/updates.md)).
 
-**Optional:** to see how full the host's filesystems are, create an empty folder on each of them (e.g. `mkdir /srv/mimamori-fs`) and mount it read-only under `/host/fs/<name>`, as shown under `volumes:` in `docker-compose.agent.yml`. The agent only asks how full the filesystem under the folder is; it cannot read a single file of the host this way. This needs agent 0.3.2 or newer.
+**Disk space (optional):** create an empty folder on each filesystem (e.g. `mkdir /srv/mimamori-fs`) and mount it read-only under `/host/fs/<name>`, as shown under `volumes:` in `docker-compose.agent.yml`. The agent only asks how full the filesystem under the folder is; it cannot read a single file of the host this way. This needs agent 0.3.2 or newer.
 
 ## Using it
 
-The **overview** shows every host with its drives. Drive problems and missing updates are ranked together as critical, medium or low, and the headline follows the worst of them. Click a drive for its history and thresholds, a host's name for its packages and updates. **Check now** makes every agent check within a minute.
+The **overview** sums up drives, systems, Docker images, status checks and backups. Everything that needs you is ranked as critical, medium or low, and the headline follows the worst of it. **Check now** on the Drives page makes every agent report within a minute.
+
+### Drives
+
+**Drives** lists every drive by host. Click one for its history, SMART table and thresholds.
 
 | State | When |
 |---|---|
@@ -74,6 +86,12 @@ The **overview** shows every host with its drives. Drive problems and missing up
 
 A few remapped sectors on an old drive can stay stable for years, a count that keeps rising cannot. That is why only growth counts as Failing.
 
+### Systems
+
+**Systems** shows every host with its operating system, missing security updates, a pending reboot and how full its filesystems are. Click a host for its packages, the updates it misses, the firmware of its drives and the trend of its disk space. A filesystem counts as filling up from 85 % and as almost full from 95 %.
+
+### Sites and services
+
 **Status** lists the websites and services the server checks itself. Add one with **Add a check** and choose what to check:
 
 | Check | What counts as up |
@@ -83,6 +101,8 @@ A few remapped sectors on an old drive can stay stable for years, a count that k
 | **Ping** | The host answers an ICMP echo request |
 
 A check counts as down after a number of failed checks in a row (2 by default), so one lost packet does not wake you up. Who gets told about down, back up and expiring certificates is chosen in **Settings → Notifications**, like everything else. The checks run on the server and see the network as it does: addresses in your home network work, loopback, link-local (`169.254.x.x`, cloud metadata) and multicast addresses are never checked, and redirects are not followed.
+
+### Backups and jobs
 
 **Backups and jobs**, also on the Status page, are the other way round: the job reports to mimamori. Add one with **Add a backup or job**, say how often it runs and how late it may be, and copy the secret URL that is shown once. The job then sends a POST to it, in the same way as for healthchecks.io:
 
@@ -95,6 +115,8 @@ A check counts as down after a number of failed checks in a row (2 by default), 
 
 For **Backrest**, add a hook of the type *Healthchecks* to the plan with this URL, for the conditions `CONDITION_SNAPSHOT_START`, `CONDITION_SNAPSHOT_SUCCESS` and `CONDITION_SNAPSHOT_ERROR`. For a script: `curl -fsS -m 10 --retry 3 -X POST <url>/$?` at its end. A failure is reported at once, a missing success once the interval plus the allowed delay has passed since the last one, which also catches a job that never started. The text in the request body (e.g. Backrest's summary) shows up on the page and in the alert.
 
+### Docker images
+
 **Docker** lists the images your containers run. Add one with **Add an image**: the image as in your compose file (`nginx`, `linuxserver/sonarr`, `ghcr.io/owner/app`), the version you run, and what counts as an update:
 
 | Choice | Example | You are told about |
@@ -105,6 +127,10 @@ For **Backrest**, add a hook of the type *Healthchecks* to the plan with this UR
 | **This tag** | `latest`, `beta` | the tag pointing to a new image (e.g. a rebuild with security fixes) |
 
 Only tags of the same form count: after `1.27.2-alpine` comes `1.27.3-alpine`. A new version shows up on the overview (and, if you turn it on under **Settings → Notifications**, in your channels). Update the container by hand, e.g. `docker compose pull && docker compose up -d`, then click **Confirm** with the version you now run. The server asks the registries every 12 hours by default, or only when you click **Check**. It never changes anything on your hosts, and the agents are not involved. Only public images work: mimamori stores no registry passwords.
+
+### API and Home Assistant
+
+Under **Settings → API tokens** you create tokens for the read-only API. It returns in one answer what the overview shows, for dashboards, scripts and the [Home Assistant integration](https://github.com/Pascal2108/mimamori-homeassistant). Nothing can be changed through it. See [API](docs/api.md).
 
 If something does not work, see [Troubleshooting](docs/troubleshooting.md).
 

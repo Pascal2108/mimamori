@@ -2,19 +2,22 @@
 
 # mimamori 見守り
 
-A self-hosted **drive health monitor**: it watches the SMART data of the drives on all your hosts, keeps their history and tells you when a drive starts to fail. *Mimamori* means "watching over".
+A self-hosted **monitor for your hosts and services**: failing drives, missing security updates, full disks, websites that stop answering, backups that failed or did not run, and Docker images with a newer version, on one page. *Mimamori* means "watching over".
 
 <br clear="left">
 
 **Full documentation, setup guide and source code: [github.com/Pascal2108/mimamori](https://github.com/Pascal2108/mimamori)**
 
-This is the **server** image with the web page. Every host with drives to watch runs the small agent image [`pascal2108/mimamori-agent`](https://hub.docker.com/r/pascal2108/mimamori-agent).
+This is the **server** image with the web page. It checks websites, services and Docker images itself and receives the reports of backups and jobs. Every host to watch runs the small agent image [`pascal2108/mimamori-agent`](https://hub.docker.com/r/pascal2108/mimamori-agent).
 
 ## Features
 
-- **One page for every host**: status, temperature, power-on hours, wear, reallocated, pending and uncorrectable sectors, with history charts and the full SMART table
-- **Thresholds you set**: defaults per drive type, overridable per drive; any bad sector marks a drive as *Watch*, a growing count as *Failing*
-- **Notifications** to Discord, mail and your own signed webhook, plus a weekly report
+- **Drives**: SMART data of every drive on every host, with history charts and thresholds you set; any bad sector marks a drive as *Watch*, a growing count as *Failing*
+- **Systems**: missing security updates of Debian, Ubuntu and Alpine hosts, pending reboots, drive firmware with known bugs, and how full each filesystem is
+- **Sites and services**: HTTP(S) with certificate expiry, TCP ports and ping, checked by the server
+- **Backups and jobs**: Backrest, cron jobs and scripts report each run to a secret URL; mimamori tells you when one fails or does not run in time
+- **Docker images**: tells you when a newer version of the images you run exists
+- **Notifications** to Discord, mail and your own signed webhook, plus a weekly report; a read-only API and a Home Assistant integration
 - **Safe agent connection**: every message between agent and server is encrypted, signed in both directions and cannot be replayed; the server keeps only public keys
 - **Hardened container**: runs as non-root, read-only, all capabilities dropped
 

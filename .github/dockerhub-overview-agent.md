@@ -2,7 +2,7 @@
 
 # mimamori agent
 
-The small agent for [mimamori](https://hub.docker.com/r/pascal2108/mimamori), the self-hosted drive health monitor. It reads the SMART data of a host's drives with smartctl and reports it to the mimamori server.
+The small agent for [mimamori](https://hub.docker.com/r/pascal2108/mimamori), the self-hosted monitor for your hosts and services. It reads the SMART data of a host's drives with smartctl and, if you mount them, its package list and the fill level of its filesystems, and reports them to the mimamori server.
 
 <br clear="left">
 
