@@ -87,17 +87,53 @@ jobs:
             VERSION=${{ steps.image.outputs.version }}
           tags: ${{ steps.image.outputs.tags }}
 
-      # Every pushed image is scanned for known vulnerabilities in its system and Python
-      # packages, by its digest, so it is exactly the image that was just built. Found are
-      # listed in the log; one that is high or critical and has a fix fails the run (and with
-      # it the release page), so it gets looked at. The image is published anyway: the weekly
-      # rebuild must not stop bringing fixes because one package has no update yet.
-      # trivy-action had its tags replaced by malicious code in March 2026 (GHSA-69fq-xp46-6x23):
-      # pinned to the commit of the immutable release v0.36.0, and Trivy itself to a fixed version.
+      # The digest of the image just pushed, for the scan job below
+      - env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: printf '%s' "$DIGEST" > digest
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.image }}
+          path: digest
+          retention-days: 1
+          if-no-files-found: error
+
+  # Every pushed image is scanned for known vulnerabilities in its system and Python packages,
+  # by its digest, so it is exactly the image that was just built. Found are listed in the log;
+  # one that is high or critical and has a fix fails the run (and with it the release page), so
+  # it gets looked at. The image is published anyway: the weekly rebuild must not stop bringing
+  # fixes because one package has no update yet.
+  # A job of its own with read rights only: the scanner never sees the GHCR login or a token
+  # that could push images. trivy-action had its tags replaced by malicious code in March 2026
+  # (GHSA-69fq-xp46-6x23): pinned to the commit of the immutable release v0.36.0, and Trivy
+  # itself to a fixed version.
+  scan:
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [mimamori, mimamori-agent]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: digest-${{ matrix.image }}
+      - id: digest
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          digest=$(cat digest)
+          if ! printf '%s' "$digest" | grep -Eqx 'sha256:[0-9a-f]{64}'; then
+            echo "Not an image digest: $digest" >&2
+            exit 1
+          fi
+          echo "ref=ghcr.io/pascal2108/$IMAGE@$digest" >> "$GITHUB_OUTPUT"
       - name: "Trivy: all findings (for reading, never fails)"
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ghcr.io/pascal2108/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+          image-ref: ${{ steps.digest.outputs.ref }}
           version: v0.76.1
           scanners: vuln
           format: table
@@ -106,7 +142,7 @@ jobs:
       - name: "Trivy: fail on high or critical with a fix"
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ghcr.io/pascal2108/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+          image-ref: ${{ steps.digest.outputs.ref }}
           version: v0.76.1
           skip-setup-trivy: true
           scanners: vuln
@@ -115,11 +151,11 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
 
-  # A version tag also gets a release page on GitHub, once its image exists.
+  # A version tag also gets a release page on GitHub, once its images exist and passed the scan.
   # A tag with a suffix such as v1.0.2-beta.1 is marked as a pre-release, never as the latest.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: publish
+    needs: [publish, scan]
     runs-on: ubuntu-latest
     permissions:
       contents: write
