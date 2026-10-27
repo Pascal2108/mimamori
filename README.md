@@ -6,6 +6,8 @@ A self-hosted **drive health monitor**. It watches the SMART data of the drives 
 
 <br clear="left">
 
+> **Beta:** every version below 1.0 is a beta. mimamori works and is used every day, but settings and pages may still change between versions. Read the release notes before you update.
+
 A server container runs behind your reverse proxy, and a small agent container on every host whose drives you want to watch.
 
 ![mimamori on a desktop: eight drives on two hosts, one failing with rising reallocated sectors, one to watch and one missing](docs/screenshots/desktop.png)
@@ -129,6 +131,7 @@ mimamori is built for a network you control, such as your home network or a VPN 
 - [Security](SECURITY.md#how-mimamori-is-secured): how agents connect, and how agent and server are protected
 - [Configuration](docs/configuration.md): all settings, the custom webhook and the unsafe options
 - [Missing updates](docs/updates.md), [Troubleshooting](docs/troubleshooting.md), [Updating](docs/updating.md)
+- [API](docs/api.md): the read-only API for Home Assistant and your own scripts
 - Questions and ideas: open an [issue](https://github.com/Pascal2108/mimamori/issues/new/choose), without keys, passwords, host names or serial numbers. Security problems go privately, see [SECURITY.md](SECURITY.md)
 
 Free software under the [AGPL-3.0](LICENSE), without warranty. License, liability, cookies and personal data: [Legal](docs/legal.md).

@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}API token {{ name }}{% endblock %}
+{% block content %}
+<a class="back" href="{{ url_for('settings') }}#api">← Settings</a>
+<h1 class="headline">API token “{{ name }}”</h1>
+<div class="banner unsafe-hint" role="alert"><strong>Copy the token now.</strong> It is shown only once: mimamori keeps only a hash of it. Anyone with it can read everything the overview shows (hosts, drives, checks, Docker images), so keep it out of git, issues and screenshots. If it gets lost or leaks, revoke it under Settings → API tokens and create a new one.</div>
+
+<div class="panel">
+  <h2>Token</h2>
+<pre class="code">{{ token }}</pre>
+  <p class="quiet small">It only reads: with it, nothing can be changed, no check started and no setting read.</p>
+</div>
+
+<div class="panel">
+  <h2>Home Assistant</h2>
+  <p class="quiet small">Install the mimamori integration (HACS → Custom repositories), then add it under Settings → Devices &amp; services and enter the address and this token. The address is that of mimamori as Home Assistant reaches it:</p>
+<pre class="code">{{ server_url }}</pre>
+</div>
+
+<div class="panel">
+  <h2>Anything else</h2>
+  <p class="quiet small">Send the token in the <span class="mono">Authorization</span> header. The answer is described in docs/api.md in the mimamori repository.</p>
+<pre class="code">curl -H "Authorization: Bearer $MIMAMORI_TOKEN" {{ server_url }}/api/v1/summary</pre>
+</div>
+<p><a class="btn primary" href="{{ url_for('settings') }}#api">Done</a></p>
+{% endblock %}

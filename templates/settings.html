@@ -193,4 +193,46 @@
     </form>
   </div>
 </section>
+
+<section class="section" id="api">
+  <h2>API tokens</h2>
+  <p>A token lets Home Assistant or a script read what the overview shows, through <span class="mono">/api/v1/summary</span>. It can only read: nothing can be changed with it. The API stays closed until you create a token. Revoke a token you no longer use.</p>
+  <div class="panel">
+    {% if api_tokens %}
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Name</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+      <tbody>
+      {% for t in api_tokens %}
+      <tr>
+        <td>{{ t.name }}</td>
+        <td class="small">{{ t.created|time }}</td>
+        <td class="small">{{ t.last_used|ago }}</td>
+        <td>
+          <details class="confirm">
+            <summary class="btn small danger">Revoke…</summary>
+            <form class="confirm-box" method="post" action="{{ url_for('api_token_delete', token_id=t.id) }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button class="btn small danger" type="submit">Revoke the token</button>
+            </form>
+          </details>
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    {% else %}
+    <p class="empty">No API tokens yet.</p>
+    {% endif %}
+  </div>
+  <div class="panel">
+    <h2>Create a token</h2>
+    <form class="row" method="post" action="{{ url_for('api_token_create') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="field"><label for="api-name">Name</label><input id="api-name" name="name" placeholder="Home Assistant" maxlength="48" required></div>
+      <div class="field"><button class="btn primary" type="submit">Create token</button></div>
+    </form>
+  </div>
+</section>
 {% endblock %}

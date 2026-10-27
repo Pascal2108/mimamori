@@ -698,6 +698,14 @@ CREATE TABLE IF NOT EXISTS heartbeat_pings (
     message TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS heartbeat_pings_ts ON heartbeat_pings (heartbeat_id, ts);
+-- Added in 0.3.5: read-only tokens for the summary API (Home Assistant, scripts), see docs/api.md
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,          -- SHA-256 of the token, never the token itself
+    created INTEGER NOT NULL,
+    last_used INTEGER
+);
 """
 
 
@@ -2187,6 +2195,21 @@ def new_push_token() -> tuple[str, str]:
     return token, push_token_hash(token)
 
 
+# Read-only tokens for /api/v1/: "mmr_" and 43 random characters, kept only as a hash
+API_TOKEN = re.compile(r"^mmr_[A-Za-z0-9_-]{43}$")
+API_VERSION = 1
+
+
+def api_token_hash(token: str) -> str:
+    return hashlib.sha256(b"mimamori api\0" + token.encode()).hexdigest()
+
+
+def new_api_token() -> tuple[str, str]:
+    """A new read-only API token and its hash."""
+    token = "mmr_" + secrets.token_urlsafe(32)
+    return token, api_token_hash(token)
+
+
 def push_message(raw: bytes) -> str:
     """The body of a ping as a note for the page: text only, no control characters."""
     text = raw[:MAX_PUSH_BODY].decode("utf-8", "replace")
@@ -3555,6 +3578,7 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
     login_limiter_48 = RateLimiter(MAX_TRIES_48, WINDOW)
     agent_limiter = RateLimiter(30, 300)
     push_limiter = RateLimiter(20, 300)  # unknown push URLs per address
+    api_limiter = RateLimiter(20, 300)  # wrong API tokens per address
     asset_version = _asset_version()
 
     # helpers --------------------------------------------------------------
@@ -3627,7 +3651,8 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
     # security hooks -------------------------------------------------------
     # The agent API and the push URLs authenticate each request themselves (a signed message,
     # a secret URL) and use no session, so they need neither a login nor a CSRF token
-    agent_api = {"agent_heartbeat", "agent_report", "push_success", "push_action"}
+    # The read-only API takes a token in the Authorization header, see api_token_check()
+    agent_api = {"agent_heartbeat", "agent_report", "push_success", "push_action", "api_summary"}
     public = {"login", "static", "health", "favicon", *agent_api}
 
     @app.before_request
@@ -3844,6 +3869,147 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         if action.isdigit() and len(action) <= 3:  # a script's exit code: 0 is success
             return push(token, "success" if int(action) == 0 else "fail")
         abort(404)
+
+    # read-only API --------------------------------------------------------
+    # For Home Assistant and scripts: GET only, a token from Settings → API tokens in the
+    # header "Authorization: Bearer mmr_…". Documented in docs/api.md; fields are only ever
+    # added, a change that would break a client gets /api/v2/.
+    def api_token_check() -> None:
+        key = limit_key(client_ip())
+        if api_limiter.blocked(key):
+            abort(429)
+        scheme, _, token = request.headers.get("Authorization", "").partition(" ")
+        token = token.strip()
+        row = None
+        if scheme.lower() == "bearer" and API_TOKEN.match(token):
+            # Looked up by its hash, so the lookup does not depend on the token's letters
+            row = db.one("SELECT id, last_used FROM api_tokens WHERE token_hash = ?",
+                         (api_token_hash(token),))
+        if row is None:
+            api_limiter.hit(key)
+            log.warning("API request with a wrong or missing token from %s", client_ip())
+            abort(401)
+        now = int(time.time())
+        if not row["last_used"] or now - row["last_used"] >= 60:  # not a write per poll
+            db.execute("UPDATE api_tokens SET last_used = ? WHERE id = ?", (now, row["id"]))
+
+    def api_ts(ts: int | None) -> int | None:
+        return int(ts) if ts else None
+
+    def api_sev(level: str | None) -> str:
+        """high/middle/low as the API names them: critical, medium, low; none without one."""
+        return SEVERITY_NAMES.get(level, "none") if level else "none"
+
+    @app.get("/api/v1/summary")
+    def api_summary():
+        api_token_check()
+        now = int(time.time())
+        base = cfg.public_url or request.host_url.rstrip("/")
+        agents, drives = drive_cards()
+        items = attention_items(agents, drives)
+        att = attention_summary(items)
+        system = system_stats(agents)
+        hosts = {a["id"]: a["name"] for a in agents}
+        up = uptimes((1, 30))
+        monitors = [monitor_view(dict(r), now) for r in db.all(
+            "SELECT * FROM monitors ORDER BY name COLLATE NOCASE")]
+        pushes = [heartbeat_view(dict(r), now) for r in db.all(
+            "SELECT * FROM heartbeats ORDER BY name COLLATE NOCASE")]
+        images = [image_view(dict(r)) for r in db.all(
+            "SELECT * FROM images ORDER BY name COLLATE NOCASE")]
+        alerts = db.all("SELECT al.*, a.name AS host FROM alerts al LEFT JOIN agents a "
+                        "ON a.id = al.agent_id ORDER BY al.ts DESC, al.id DESC LIMIT 10")
+        return jsonify({
+            "api_version": API_VERSION,
+            "server": {"version": VERSION, "generated": now, "url": base},
+            "status": {
+                "severity": api_sev(att["worst"]),
+                "problems": att["total"],
+                "headline": POND[att["worst"]] if drives or items else "The pond is still.",
+                "by_severity": {SEVERITY_NAMES[k]: v for k, v in att["levels"].items()},
+                "by_kind": att["kinds"],
+            },
+            "attention": [{"severity": api_sev(i["level"]), "kind": i["kind"],
+                           "count": i["count"], "host": i["host"], "text": i["text"],
+                           "url": base + i["url"]} for i in items],
+            "counts": {
+                "hosts": len(agents),
+                "hosts_offline": sum(1 for a in agents if a["last_seen"] and not a["online"]),
+                "drives": {s: sum(1 for d in drives if d["status"] == s) for s in STATUS_ORDER},
+                "security_updates": {SEVERITY_NAMES[k]: v
+                                     for k, v in system["updates"].items()},
+                "reboot_required": system["reboot"],
+                "storage_problems": system["storage"],
+                "monitors": {s: sum(1 for m in monitors if m["state"] == s)
+                             for s in ("up", "down", "pending", "paused")},
+                "push_checks": {s: sum(1 for h in pushes if h["state"] == s)
+                                for s in ("up", "late", "failed", "new", "paused")},
+                "docker_images": {s: sum(1 for i in images if i["state"] == s)
+                                  for s in ("current", "available", "error", "pending")},
+            },
+            "hosts": [{
+                "id": a["id"], "name": a["name"], "location": a["location"],
+                "online": a["online"], "last_seen": api_ts(a["last_seen"]),
+                "last_report": api_ts(a["last_report"]), "agent_version": a["agent_version"],
+                "hostname": a["hostname"],
+                "os": {"name": a["os"].get("name", ""), "kernel": a["os"].get("kernel", "")},
+                "reboot_required": bool(a["os"].get("reboot")),
+                "security_updates": dict({SEVERITY_NAMES[k]: v for k, v in
+                                          a["update_counts"].items()}, total=a["update_total"]),
+                "updates_checked": api_ts(a["updates_checked"]),
+                "filesystems": [{"name": f["name"], "type": f["fstype"], "total": f["total"],
+                                 "used": f["used"], "free": f["free"],
+                                 "used_percent": f["percent"],
+                                 "level": f["level"] or "ok"} for f in a["filesystems"]],
+                "url": base + url_for("host", agent_id=a["id"]),
+            } for a in agents],
+            "drives": [{
+                "id": d["id"], "host_id": d["agent_id"], "host": hosts.get(d["agent_id"], ""),
+                "name": drive_name(d), "model": d["model"], "device": d["device"],
+                "serial": "" if d["serial"].startswith("no-serial:") else d["serial"],
+                "firmware": d["firmware"], "kind": d["kind"], "capacity": d["capacity"],
+                "status": d["status"], "summary": d["summary"],
+                "issues": [{"metric": k, "level": v["level"], "text": v["text"]}
+                           for k, v in d["issues"].items()],
+                "muted": bool(d["muted"]), "standby": bool(d["standby"]),
+                "no_smart": d["no_smart"], "temperature_ignored": bool(d["temp_ignored"]),
+                "temperature": d["latest"].get("temp"),
+                "power_on_hours": d["latest"].get("power_on_hours"),
+                "wear_percent": d["latest"].get("wear"),
+                "reallocated_sectors": d["latest"].get("reallocated"),
+                "pending_sectors": d["latest"].get("pending"),
+                "media_errors": d["latest"].get("media_errors"),
+                "firmware_update": api_sev(d["fw"]["level"]) if d["fw"] else None,
+                "last_seen": api_ts(d["last_seen"]),
+                "url": base + url_for("drive", drive_id=d["id"]),
+            } for d in sorted(drives, key=lambda d: (hosts.get(d["agent_id"], ""), d["device"]))],
+            "monitors": [{
+                "id": m["id"], "name": m["name"], "kind": m["kind"], "target": m["display"],
+                "status": m["state"], "last_check": api_ts(m["last_check"]),
+                "response_ms": m["last_ms"], "last_error": m["last_error"],
+                "certificate_expires": api_ts(m["tls_expires"]),
+                "certificate_expiring": bool(m["tls_level"]),
+                "uptime_24h": up.get(m["id"], {}).get(1),
+                "uptime_30d": up.get(m["id"], {}).get(30),
+                "url": base + url_for("monitor_page", monitor_id=m["id"]),
+            } for m in monitors],
+            "push_checks": [{
+                "id": h["id"], "name": h["name"], "status": h["state"],
+                "running": bool(h["running"]), "last_ping": api_ts(h["last_ping"]),
+                "last_success": api_ts(h["last_success"]),
+                "deadline": None if h["paused"] else api_ts(h["deadline"]),
+                "interval": h["interval"],
+                "url": base + url_for("push_page", heartbeat_id=h["id"]),
+            } for h in pushes],
+            "docker_images": [{
+                "id": i["id"], "name": i["name"], "image": i["display"],
+                "version": i["version"], "latest": i["latest"] or None, "state": i["state"],
+                "checked": api_ts(i["checked"]), "error": i["error"],
+                "url": base + url_for("docker_page") + f"#image-{i['id']}",
+            } for i in images],
+            "alerts": [{"ts": a["ts"], "kind": a["kind"], "level": a["level"],
+                        "title": a["title"], "host": a["host"] or ""} for a in alerts],
+        })
 
     # pages ----------------------------------------------------------------
     def drive_cards() -> tuple[list[dict], list[dict]]:
@@ -4859,7 +5025,34 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             thresholds=monitor.thresholds_for(None), kinds=KINDS, counters=COUNTERS,
             growth_choices=GROWTH_CHOICES, channels=monitor.notifier.channels(),
             weekdays=WEEKDAYS, tz_name=str(tz), rules=monitor.notify_rules(),
-            topics=NOTIFY_TOPICS, updates_enabled=monitor.setting("updates_check_enabled"))
+            topics=NOTIFY_TOPICS, updates_enabled=monitor.setting("updates_check_enabled"),
+            api_tokens=db.all("SELECT id, name, created, last_used FROM api_tokens "
+                              "ORDER BY name COLLATE NOCASE"))
+
+    @app.post("/settings/api-tokens")
+    def api_token_create():
+        name = clean_text(request.form.get("name", ""), 48)
+        if not name:
+            abort(400, "The token needs a name, e.g. Home Assistant.")
+        if db.one("SELECT COUNT(*) AS n FROM api_tokens")["n"] >= 50:
+            abort(400, "There are 50 API tokens already. Revoke one you no longer use.")
+        token, token_hash = new_api_token()
+        db.execute("INSERT INTO api_tokens (name, token_hash, created) VALUES (?, ?, ?)",
+                   (name, token_hash, int(time.time())))
+        log.info("API token %s created", name)
+        # Shown once: the server keeps only a hash of the token
+        return render_template("api_token.html", name=name, token=token,
+                               server_url=cfg.public_url or request.host_url.rstrip("/"))
+
+    @app.post("/settings/api-tokens/<int:token_id>/delete")
+    def api_token_delete(token_id: int):
+        row = db.one("SELECT name FROM api_tokens WHERE id = ?", (token_id,))
+        if row is None:
+            abort(404)
+        db.execute("DELETE FROM api_tokens WHERE id = ?", (token_id,))
+        log.info("API token %s revoked", row["name"])
+        flash(f"API token {row['name']} revoked. Whatever used it has no access any more.")
+        return redirect(url_for("settings") + "#api")
 
     @app.post("/settings/notifications")
     def settings_notifications():
