@@ -1891,6 +1891,7 @@ IMAGE_WORKERS = 2
 REGISTRY_TIMEOUT = 15
 MAX_REGISTRY_BYTES = 4 * 1024 * 1024
 MAX_TAG_PAGES = 20             # of 1,000 tags each
+MAX_TAGS = 50_000              # in all: a hostile registry must not fill the memory
 MAX_NEWER = 20
 MAX_TOKEN = 8192
 DOCKER_HUB_NAMES = ("docker.io", "index.docker.io", "registry-1.docker.io",
@@ -2121,6 +2122,8 @@ class RegistryClient:
             page = data.get("tags") if isinstance(data, dict) else None
             if page is not None and not isinstance(page, list):
                 raise RegistryError("The registry's tag list is not valid")
+            if len(tags) + len(page or []) > MAX_TAGS:
+                raise RegistryError(f"The image has more than {MAX_TAGS:,} tags")
             tags += [t for t in page or [] if isinstance(t, str) and IMAGE_TAG.match(t)]
             link = re.match(r'\s*<([^>]+)>\s*;\s*rel="?next"?', hdrs.get("link", ""))
             if not link:
@@ -2131,7 +2134,7 @@ class RegistryClient:
                     or nxt.path != f"/v2/{self.repo}/tags/list":
                 raise RegistryError("The registry's next page is somewhere else")
             path = urllib.parse.urlunsplit(("", "", nxt.path, nxt.query, ""))
-        raise RegistryError(f"The image has more than {MAX_TAG_PAGES * 1000:,} tags")
+        raise RegistryError(f"The registry's tag list has more than {MAX_TAG_PAGES} pages")
 
     def digest(self, tag: str) -> str:
         """The digest the tag points to now. HEAD first: Docker Hub does not count it as a
@@ -3662,6 +3665,12 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             return None
         if endpoint not in public and not signed_in():
             session.clear()
+            # The API never sends anyone to the login page: the path may be a secret push
+            # URL, which would end up in the login link (and so in the browser history)
+            if request.path.startswith("/api/"):
+                if request.routing_exception is not None:
+                    raise request.routing_exception  # 404, or 405 for a GET to a push URL
+                abort(401)
             if request.method == "GET":
                 return redirect(url_for("login", next=request.path))
             abort(401)
@@ -3841,8 +3850,14 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         key = limit_key(client_ip())
         if push_limiter.blocked(key):
             abort(429)
-        row = db.one("SELECT id FROM heartbeats WHERE token_hash = ?",
-                     (push_token_hash(token),)) if PUSH_TOKEN.match(token) else None
+        # Every failure is handled here, the lookup included: Flask would log it with the
+        # request path, which is the secret URL
+        try:
+            row = db.one("SELECT id FROM heartbeats WHERE token_hash = ?",
+                         (push_token_hash(token),)) if PUSH_TOKEN.match(token) else None
+        except Exception:
+            log.exception("Looking up a push URL failed")
+            abort(500)
         if row is None:
             push_limiter.hit(key)
             log.warning("Push to an unknown URL from %s", client_ip())  # never the URL itself
@@ -3851,7 +3866,6 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             message = push_message(request.stream.read(MAX_PUSH_BODY))
             taken = monitor.record_push(row["id"], kind, message)
         except Exception:
-            # Handled here: Flask would log the failure with the request path, the secret URL
             log.exception("Push for check %d failed", row["id"])
             abort(500)
         if not taken:
