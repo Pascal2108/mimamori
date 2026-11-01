@@ -50,7 +50,8 @@
     <strong>{{ worst.text }}{% if d.issues|length > 1 %}, plus {{ d.issues|length - 1 }} more issue{{ 's' if d.issues|length > 2 }}{% endif %}.</strong>
     <p>
       {% if d.status == 'missing' %}The agent no longer sees this drive. If you removed it on purpose, forget it at the bottom of this page.
-      {% elif 'smart' in d.issues %}The drive itself reports that it is failing. Back up now and replace it.
+      {% elif 'smart' in d.issues or (d.issues.critical_warning and d.issues.critical_warning.level == 'crit') %}The drive itself reports that it is failing. Back up now and replace it.
+      {% elif d.issues.critical_warning and d.status != 'failing' %}The drive reports a temperature outside its limits. Check its cooling; if the reading cannot be right (some USB enclosures report nonsense), ignore the temperature in the Thresholds section below.
       {% elif d.status == 'failing' %}{% if latest.smart_passed %}SMART overall health still says PASSED, but the numbers are getting worse. {% endif %}Back up what lives on it and plan a replacement.
       {% else %}Keep an eye on it. You can adjust the thresholds below.{% endif %}
     </p>

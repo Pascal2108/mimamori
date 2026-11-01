@@ -440,12 +440,15 @@ def find_issues(sample: dict, baseline: dict | None, kind: str, thresholds: dict
     """Issues for the newest sample. Growth is measured against `baseline`.
     temp=False leaves the temperature out (a drive whose sensor is marked as faulty)."""
     issues: dict[str, dict] = {}
-    if sample.get("smart_passed") in (False, 0):
-        issues["smart"] = {"level": "crit", "value": 0, "text": "SMART overall health check FAILED"}
     cw = sample.get("critical_warning")
+    # For NVMe, smartctl reports FAILED whenever a critical warning flag is set; the flags
+    # then explain it better than a second "FAILED" issue
+    if sample.get("smart_passed") in (False, 0) and not cw:
+        issues["smart"] = {"level": "crit", "value": 0, "text": "SMART overall health check FAILED"}
     if cw:
-        issues["critical_warning"] = {"level": "crit", "value": cw,
-                                      "text": f"NVMe critical warning flags set ({cw})"}
+        issue = _critical_warning_issue(cw, temp)
+        if issue:
+            issues["critical_warning"] = issue
     temp = sample.get("temp") if temp else None
     t = thresholds["temp"].get(kind) or thresholds["temp"]["unknown"]
     level = _level(temp, t["warn"], t["crit"])
@@ -472,6 +475,32 @@ def find_issues(sample: dict, baseline: dict | None, kind: str, thresholds: dict
             text = f"{value} {label}" + (f" (+{value - prev})" if grew else "")
             issues[metric] = {"level": level, "value": value, "text": text}
     return issues
+
+
+# NVMe critical warning bits (NVMe spec, SMART / Health log byte 0)
+NVME_WARNING_TEMP = 0x02
+NVME_WARNING_BITS = (
+    (0x01, "spare below threshold"),
+    (NVME_WARNING_TEMP, "temperature out of range"),
+    (0x04, "reliability degraded"),
+    (0x08, "read-only"),
+    (0x10, "volatile memory backup failed"),
+    (0x20, "persistent memory read-only"),
+)
+
+
+def _critical_warning_issue(cw: int, temp: bool) -> dict | None:
+    """The issue for an NVMe critical warning value. The temperature flag alone only warns
+    (it is also set by implausible sensor readings, e.g. some USB bridges) and is left out
+    when the drive's sensor is marked as faulty; every other flag is critical."""
+    if not temp:
+        cw &= ~NVME_WARNING_TEMP
+    if not cw:
+        return None
+    names = [name for bit, name in NVME_WARNING_BITS if cw & bit] or ["unknown flag"]
+    level = "warn" if cw == NVME_WARNING_TEMP else "crit"
+    return {"level": level, "value": cw,
+            "text": f"NVMe critical warning: {', '.join(names)} ({cw})"}
 
 
 def status_of(issues: dict) -> str:
