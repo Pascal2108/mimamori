@@ -15,9 +15,12 @@ The server imports the protocol functions from this file, so both sides share on
 from __future__ import annotations
 
 import base64
+import gzip
 import http.client
+import itertools
 import json
 import logging
+import lzma
 import os
 import re
 import shutil
@@ -396,6 +399,108 @@ def _read_apk(path: Path) -> list[list[str]]:
     return out
 
 
+# (optional) apt's package index (/var/lib/apt/lists, as of the host's last "apt update"):
+# the versions apt could install, so the server can show regular updates too, not only
+# security fixes. The agent only collects the versions of installed packages; which of them
+# are newer, the server decides.
+APT_LISTS = "var/lib/apt/lists"
+MAX_LIST_FILES = 500
+MAX_LIST_BYTES = 1 << 30      # per index file, after unpacking
+MAX_AVAILABLE = 20000
+_apt_cache: dict[str, Any] = {"key": None, "value": None}
+
+
+def _open_list(path: Path):
+    if path.name.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    if path.name.endswith(".xz"):
+        return lzma.open(path, "rt", encoding="utf-8", errors="replace")
+    return open(path, encoding="utf-8", errors="replace")
+
+
+def _release_flags(path: Path) -> str:
+    """"n" for a NotAutomatic suite (backports, experimental: apt does not upgrade to it on
+    its own), "nb" when it also says ButAutomaticUpgrades, "" otherwise."""
+    flags = {}
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for _, line in zip(range(200), f):
+            key, sep, value = line.partition(":")
+            if sep and key in ("NotAutomatic", "ButAutomaticUpgrades"):
+                flags[key] = value.strip().lower() == "yes"
+            elif key in ("MD5Sum", "SHA1", "SHA256", "SHA512"):
+                break
+    if not flags.get("NotAutomatic"):
+        return ""
+    return "nb" if flags.get("ButAutomaticUpgrades") else "n"
+
+
+def _read_available(installed: list[list[str]]) -> dict | None:
+    """{"type": "apt", "updated": newest index time, "list": [[name, arch, version, flags]]}
+    with the versions in apt's index of the installed packages that differ from the installed
+    one. None when the index is not mounted. Read again only when the index changed."""
+    lists = HOST_ROOT / APT_LISTS
+    if not lists.is_dir():
+        return None
+    files, releases, lz4 = [], {}, False
+    for entry in sorted(os.scandir(lists), key=lambda e: e.name)[:MAX_LIST_FILES * 4]:
+        if not entry.is_file(follow_symlinks=False):
+            continue
+        name = entry.name
+        if name.endswith(("_InRelease", "_Release")):
+            releases[name.rsplit("_", 1)[0] + "_"] = Path(entry.path)
+        elif re.search(r"_Packages(\.gz|\.xz)?$", name) and len(files) < MAX_LIST_FILES:
+            st = entry.stat(follow_symlinks=False)
+            files.append((name, Path(entry.path), st.st_mtime_ns, st.st_size))
+        elif name.endswith("_Packages.lz4"):
+            lz4 = True
+    if not files:
+        if lz4 and not _apt_cache.get("lz4_warned"):
+            _apt_cache["lz4_warned"] = True
+            log.warning("apt's package index under %s is lz4-compressed (Acquire::GzipIndexes, "
+                        "common in Docker images), which the agent cannot read: regular "
+                        "updates are not reported", lists)
+        return None
+    by_package = {(p[0], p[3]): p[1] for p in installed if len(p) >= 4}
+    key = (tuple((n, m, s) for n, _, m, s in files), hash(frozenset(by_package.items())))
+    if _apt_cache["key"] == key:
+        return _apt_cache["value"]
+
+    found: dict[tuple[str, str, str], str] = {}
+    for name, path, _, _ in files:
+        # The suite's Release file is the one with the longest prefix of this file's name
+        prefix = max((p for p in releases if name.startswith(p)), key=len, default=None)
+        flags = _release_flags(releases[prefix]) if prefix else ""
+        pkg = arch = version = ""
+        size = 0
+        with _open_list(path) as f:
+            for line in itertools.chain(f, ["\n"]):  # streamed: index files are large
+                size += len(line)
+                if size > MAX_LIST_BYTES:
+                    break
+                first = line[:1]
+                # Most lines are descriptions and dependencies: a look at the first character
+                # skips them, which keeps a 100 MB index to a few seconds
+                if first == "\n":
+                    have = by_package.get((pkg, arch))
+                    if have is not None and version and version != have:
+                        # The same version in two suites: the automatic one counts
+                        if found.get((pkg, arch, version), "x") != "":
+                            found[(pkg, arch, version)] = flags
+                    pkg = arch = version = ""
+                elif first == "P" and line.startswith("Package:"):
+                    pkg = line[8:].strip()[:MAX_FIELD]
+                elif first == "A" and line.startswith("Architecture:"):
+                    arch = line[13:].strip()[:MAX_FIELD]
+                elif first == "V" and line.startswith("Version:"):
+                    version = line[8:].strip()[:MAX_FIELD]
+        if len(found) >= MAX_AVAILABLE:
+            break
+    value = {"type": "apt", "updated": int(max(m for _, _, m, _ in files) // 10**9),
+             "list": [[p, a, v, fl] for (p, a, v), fl in sorted(found.items())][:MAX_AVAILABLE]}
+    _apt_cache.update(key=key, value=value)
+    return value
+
+
 def read_host() -> dict | None:
     """The host's OS and installed packages, or None when they are not mounted."""
     sources = (("dpkg", HOST_ROOT / "var/lib/dpkg/status", _read_dpkg),
@@ -414,6 +519,15 @@ def read_host() -> dict | None:
         return None
     if not host:
         return None
+    if host.get("packages", {}).get("type") == "dpkg":
+        try:
+            available = _read_available(host["packages"]["list"])
+        except (OSError, EOFError, ValueError, lzma.LZMAError) as exc:
+            log.warning("Cannot read apt's package index under %s: %s", HOST_ROOT / APT_LISTS,
+                        getattr(exc, "strerror", None) or type(exc).__name__)
+            available = None
+        if available:
+            host["available"] = available
     # The container shares the host's kernel: this is the kernel the host runs right now
     host["kernel"] = os.uname().release if hasattr(os, "uname") else ""
     return host

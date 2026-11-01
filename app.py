@@ -750,6 +750,8 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("alerts", "image_id", "INTEGER REFERENCES images(id) ON DELETE CASCADE"),
     # Alerts of the push checks (0.3.3)
     ("alerts", "heartbeat_id", "INTEGER REFERENCES heartbeats(id) ON DELETE CASCADE"),
+    # Regular updates from apt's package index (0.3.8), JSON; '' when the agent sends none
+    ("hosts", "upgrades", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 
@@ -1195,7 +1197,40 @@ def parse_host(raw: Any) -> dict | None:
         "package_type": package_type,
         "ecosystem": osv_ecosystem(os_release, package_type),
     }
-    return {"os": info, "packages": packages}
+    return {"os": info, "packages": packages,
+            "upgrades": parse_available(raw.get("available"), packages)}
+
+
+MAX_UPGRADES = 5000
+
+
+def parse_available(raw: Any, packages: list[dict]) -> dict | None:
+    """Regular updates from apt's package index, sent by agents from 0.3.8 on (when it is
+    mounted): {"updated": time of the index, "list": [{name, arch, installed, available,
+    source}]}. Like apt, the highest version wins; suites that apt does not upgrade to on its
+    own (NotAutomatic: backports, experimental) only count for packages already installed
+    from backports. Pins in /etc/apt/preferences are not known here. None without an index."""
+    if not isinstance(raw, dict) or raw.get("type") != "apt" or not isinstance(raw.get("list"), list):
+        return None
+    installed = {(p["name"], p["arch"]): p for p in packages}
+    best: dict[tuple[str, str], str] = {}
+    for item in raw["list"][:MAX_PACKAGES * 4]:
+        if not isinstance(item, list) or len(item) < 4:
+            continue
+        name, arch, version, flags = (clean_text(x, 200) for x in item[:4])
+        p = installed.get((name, arch))
+        if not p or not PKG_VERSION.match(version) or flags not in ("", "n", "nb"):
+            continue
+        if flags == "n" or (flags == "nb" and "bpo" not in p["version"]):
+            continue
+        if version_compare(version, p["version"]) > 0 and (
+                (name, arch) not in best or version_compare(version, best[(name, arch)]) > 0):
+            best[(name, arch)] = version
+    updated = _num(raw.get("updated"))
+    return {"updated": updated if updated and 0 < updated < 2**40 else None,
+            "list": [{"name": n, "arch": a, "installed": installed[(n, a)]["version"],
+                      "available": v, "source": installed[(n, a)]["source"]}
+                     for (n, a), v in sorted(best.items())][:MAX_UPGRADES]}
 
 
 FS_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
@@ -2394,14 +2429,17 @@ class Monitor:
                 digest = hashlib.sha256((host["os"]["ecosystem"] + packages).encode()).hexdigest()
                 # A changed package list is checked again right away
                 conn.execute(
-                    """INSERT INTO hosts (agent_id, os_info, packages, packages_hash, reported)
-                       VALUES (?, ?, ?, ?, ?)
+                    """INSERT INTO hosts (agent_id, os_info, packages, packages_hash, reported,
+                                          upgrades)
+                       VALUES (?, ?, ?, ?, ?, ?)
                        ON CONFLICT (agent_id) DO UPDATE SET
                            os_info = excluded.os_info, packages = excluded.packages,
                            packages_hash = excluded.packages_hash, reported = excluded.reported,
+                           upgrades = excluded.upgrades,
                            checked = CASE WHEN hosts.packages_hash = excluded.packages_hash
                                      THEN hosts.checked END""",
-                    (agent["id"], json.dumps(host["os"]), packages, digest, now))
+                    (agent["id"], json.dumps(host["os"]), packages, digest, now,
+                     json.dumps(host["upgrades"]) if host["upgrades"] is not None else ""))
             if filesystems is not None:
                 pending_alerts += self._store_filesystems(conn, agent, filesystems, now)
             for rec in records:
@@ -4339,7 +4377,9 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
                        "crit": monitor.setting("fs_crit_percent")},
             summary=(summary := host_summary(row, drives)),
             refresh=summary["update_progress"] is not None or summary["update_queued"],
-            updates=json.loads(row["updates"]) if row else [],
+            updates=(updates := json.loads(row["updates"]) if row else []),
+            upgrades=json.loads(row["upgrades"]) if row and row["upgrades"] else None,
+            security_sources={u["package"] for u in updates},
             packages=json.loads(row["packages"]) if row else [],
             check_enabled=monitor.setting("updates_check_enabled"),
             next_check=monitor.next_update_check(row))

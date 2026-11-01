@@ -22,8 +22,9 @@ services:
       - /dev/sda:/dev/sda:r
     # (optional) Missing security updates of this host: mount its OS and package list
     # read-only, and the server checks them against the OSV vulnerability database.
-    # Debian, Ubuntu, Proxmox: remove the # in front of the first three lines.
-    # Alpine: remove it in front of the first two lines and the third.
+    # Debian, Ubuntu, Proxmox: remove the # in front of the os-release and dpkg lines, and
+    # the apt line to also see every regular update apt would install (agent 0.3.8 or newer).
+    # Alpine: remove it in front of the os-release and apk lines.
     # (optional) How full the host's filesystems are: create an empty folder on each one
     # (e.g. mkdir /srv/mimamori-fs /mnt/data/.mimamori-fs) and mount it read-only under
     # /host/fs/<name>, as in the last two lines. The agent only asks how full the filesystem
@@ -31,6 +32,7 @@ services:
     # volumes:
     #   - /etc/os-release:/host/etc/os-release:ro
     #   - /var/lib/dpkg:/host/var/lib/dpkg:ro
+    #   - /var/lib/apt/lists:/host/var/lib/apt/lists:ro
     #   - /lib/apk/db:/host/lib/apk/db:ro
     #   - /srv/mimamori-fs:/host/fs/root:ro
     #   - /mnt/data/.mimamori-fs:/host/fs/data:ro

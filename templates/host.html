@@ -24,7 +24,7 @@
 <div class="tiles">
   <div class="tile"><div class="label">System</div><div class="value small-value">{{ summary.os.name or '–' }}</div><div class="sub">{{ summary.os.ecosystem or 'not covered by the check' if h else 'not reported' }}</div></div>
   <div class="tile"><div class="label">Kernel running</div><div class="value small-value mono">{{ summary.os.kernel or '–' }}</div><div class="sub">{% if summary.os.reboot %}<span class="warn">reboot needed: {{ summary.os.reboot }} is installed</span>{% else %}since the last reboot{% endif %}</div></div>
-  <div class="tile"><div class="label">Packages</div><div class="value">{{ packages|length if h else '–' }}</div><div class="sub">{% if h %}reported {{ h.reported|ago }}{% else %}not reported{% endif %}</div></div>
+  <div class="tile"><div class="label">Packages</div><div class="value">{{ packages|length if h else '–' }}</div><div class="sub">{% if h %}reported {{ h.reported|ago }}{% if upgrades and upgrades.list %} · <a href="#upgrades">{{ upgrades.list|length }} update{{ 's' if upgrades.list|length != 1 }} available</a>{% endif %}{% else %}not reported{% endif %}</div></div>
   <div class="tile"><div class="label">Missing updates</div><div class="value {{ 'crit' if summary.update_counts.high else 'warn' if summary.update_counts.middle else 'ok' if h and h.checked else '' }}">{{ summary.update_total if h and h.checked else '–' }}</div><div class="sub">{% if summary.update_total %}{{ summary.update_counts.high }} high · {{ summary.update_counts.middle }} middle · {{ summary.update_counts.low }} low{% elif h and h.checked %}none known{% else %}not checked yet{% endif %}</div></div>
   <div class="tile"><div class="label">Disk space</div><div class="value {{ fullest.level if fullest }}">{{ fullest.percent ~ ' %' if fullest else '–' }}</div><div class="sub">{% if fullest %}{{ fullest.name }} is the fullest · {{ filesystems|length }} filesystem{{ 's' if filesystems|length != 1 }}{% else %}not reported{% endif %}</div></div>
   <div class="tile"><div class="label">Drive firmware</div><div class="value {{ 'warn' if summary.firmware_issues }}">{{ summary.firmware_issues }}</div><div class="sub">update{{ 's' if summary.firmware_issues != 1 }} recommended · {{ drives|length }} drive{{ 's' if drives|length != 1 }}</div></div>
@@ -96,6 +96,34 @@
     {% endif %}
   </div>
 </section>
+
+{% if h and summary.os.package_type == 'dpkg' %}
+<section class="section" id="upgrades">
+  <h2>All available updates</h2>
+  <div class="panel">
+    {% if upgrades is none %}
+    <p class="empty">This agent does not report apt's package index. To see every update apt would install (not only security fixes), mount <span class="mono">/var/lib/apt/lists</span> read-only into the agent (see <span class="mono">volumes</span> in docker-compose.agent.yml), then recreate the agent container. This needs agent 0.3.8 or newer.</p>
+    {% elif not upgrades.list %}
+    <p class="empty">The host is up to date with apt's package index{% if upgrades.updated %} from {{ upgrades.updated|ago }}{% endif %}.</p>
+    {% else %}
+    <p class="quiet small">{{ upgrades.list|length }} package{{ 's' if upgrades.list|length != 1 }} with a newer version in apt's package index{% if upgrades.updated %}, as of the host's last <span class="mono">apt update</span> {{ upgrades.updated|ago }}{% endif %}. Pins in /etc/apt/preferences are not taken into account.</p>
+    <details>
+      <summary class="btn">Show the {{ upgrades.list|length }} update{{ 's' if upgrades.list|length != 1 }}</summary>
+      <div class="table-wrap">
+      <table>
+        <thead><tr><th>Package</th><th class="mono">Installed</th><th class="mono">Available</th><th>Architecture</th><th></th></tr></thead>
+        <tbody>
+        {% for u in upgrades.list %}
+        <tr><td>{{ u.name }}</td><td class="mono">{{ u.installed }}</td><td class="mono">{{ u.available }}</td><td class="quiet">{{ u.arch }}</td><td>{% if u.source in security_sources %}<span class="warn small">security fix</span>{% endif %}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </details>
+    {% endif %}
+  </div>
+</section>
+{% endif %}
 
 <section class="section">
   <h2>Drive firmware</h2>

@@ -4,13 +4,19 @@ mimamori checks two things besides the drives' health: missing security updates 
 
 ## Host packages
 
-An agent from 0.3.0 on reports the host's installed packages when its package list is mounted. To set that up, remove the `#` in front of the `volumes:` lines for your system in `docker-compose.agent.yml` (Debian, Ubuntu and Proxmox: `os-release` and `dpkg`; Alpine: `os-release` and `apk`), recreate the agent, and turn the check on under **Settings → Updates** on the page.
+An agent from 0.3.0 on reports the host's installed packages when its package list is mounted. To set that up, remove the `#` in front of the `volumes:` lines for your system in `docker-compose.agent.yml` (Debian, Ubuntu and Proxmox: `os-release` and `dpkg`, optionally `apt`, see below; Alpine: `os-release` and `apk`), recreate the agent, and turn the check on under **Settings → Updates** on the page.
 
 The server looks the packages up in the [OSV database](https://osv.dev), which carries the security trackers of Debian, Ubuntu and Alpine, twice a day (or once a day at the time set under **Settings → Updates**) and right after the list changes. A package counts as missing an update when a known vulnerability affects the installed version and the distribution has released a fixed version. Each one is rated by the distribution's own priority (Ubuntu priority, Debian urgency) or else by its CVSS score: **critical** from 7.0, **medium** from 4.0, **low** below; unrated ones count as medium. Vulnerabilities without a fixed version are only counted.
 
 The host's page (click its name on the overview) lists every package with the version that fixes it, the vulnerabilities, the running kernel and all installed packages. While a check runs, the host's page and the overview show how far it has got in percent. The first check of a host takes a few minutes, later ones only fetch what changed.
 
 The check sends the package names, versions and the release (e.g. `Debian:12`) to `api.osv.dev`, run by Google; no host names, addresses or drive data. That is why it is off until you turn it on. The server needs outbound HTTPS for it, like for Discord.
+
+### All available updates (Debian, Ubuntu, Proxmox)
+
+The security check only knows fixes that are already in the OSV database, which can lag a day or two behind the distribution, and it never shows regular updates (e.g. `tzdata` from `stable-updates`). An agent from 0.3.8 on also reads apt's package index when `/var/lib/apt/lists` is mounted read-only (the `apt` line under `volumes:` in `docker-compose.agent.yml`). The host's page then lists every package that has a newer version, as of the host's last `apt update` (Debian and Ubuntu refresh the index once a day on their own), and marks those that are also a security fix.
+
+This needs no further rights: the index is readable by every user, and nothing leaves your network for it. The agent sends only the versions of installed packages and reads the index again only when it changed. Like apt, the highest version wins; backports and other suites that apt does not upgrade to on its own count only for packages installed from them. Pins in `/etc/apt/preferences` are not taken into account. An index stored lz4-compressed (`Acquire::GzipIndexes`, set in Debian's Docker images but not on normal installs) cannot be read; the agent's log says so.
 
 After a release upgrade of the host (e.g. Debian 12 to 13), restart the agent or reboot the host, as you would after such an upgrade anyway: the agent sees the new `os-release` only from its next start, and until then the packages are checked against the old release.
 
