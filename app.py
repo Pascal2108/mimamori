@@ -1487,11 +1487,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "notify_rules": {},  # channel -> topic -> bool; missing entries use NOTIFY_TOPICS
     # Off until turned on: it sends package lists to an outside service (api.osv.dev)
     "updates_check_enabled": False,
+    # "HH:MM": check once a day at this time; "" = every UPDATE_CHECK_SECONDS
+    "updates_check_time": "",
     # A filesystem is filling up (medium) or almost full (critical) at this percentage used
     "fs_warn_percent": 85,
     "fs_crit_percent": 95,
     # Docker images: how often their registries are asked (hours, 0 = only on "Check")
     "docker_check_hours": 12,
+    # "HH:MM": with docker_check_hours 24, check at this time of day; "" = 24 hours after the last
+    "docker_check_time": "",
     # Part of every session; logging out raises it, which ends every session at once. The
     # session lives only in the signed cookie, so this is how the server can revoke it.
     "session_generation": 0,
@@ -2726,10 +2730,14 @@ class Monitor:
                 log.exception("Docker image check failed")
 
     def check_due_images(self) -> None:
-        """New images, those you asked to check, and the others every docker_check_hours."""
+        """New images, those you asked to check, and the others every docker_check_hours
+        (once a day at docker_check_time, if set)."""
         hours = int(self.setting("docker_check_hours"))
         sql, params = "SELECT id FROM images WHERE checked IS NULL", ()
-        if hours:
+        slot = self.last_daily_slot("docker_check_time") if hours == 24 else None
+        if slot is not None:
+            sql, params = sql + " OR checked < ?", (int(slot.timestamp()),)
+        elif hours:
             sql, params = sql + " OR checked < ?", (int(time.time()) - hours * 3600,)
         for row in self.db.all(sql, params):
             self.check_image_soon(row["id"])
@@ -2976,11 +2984,41 @@ class Monitor:
                          "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                          (json.dumps(VERSION),))
 
+    def last_daily_slot(self, key: str, now: dt.datetime | None = None) -> dt.datetime | None:
+        """The latest time a daily check was due, by the "HH:MM" in this setting, or None when
+        no time is set."""
+        t = str(self.setting(key) or "")
+        if not t:
+            return None
+        now = now or dt.datetime.now(self.tz)
+        hour, minute = (int(x) for x in t.split(":"))
+        slot = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        return slot - dt.timedelta(days=1) if slot > now else slot
+
+    def next_update_check(self, host: sqlite3.Row | None) -> int | None:
+        """When this host is checked next."""
+        if host is None or not host["checked"]:
+            return None
+        slot = self.last_daily_slot("updates_check_time")
+        if slot is None or host["error"] or host["checked"] < slot.timestamp():
+            # Every 12 hours, or the retry an hour after a failed check
+            return host["checked"] + UPDATE_CHECK_SECONDS
+        return int((slot + dt.timedelta(days=1)).timestamp())
+
     def check_due_updates(self) -> None:
         if not self.setting("updates_check_enabled"):
             return
-        for row in self.db.all("SELECT agent_id FROM hosts WHERE checked IS NULL OR checked < ?",
-                               (int(time.time()) - UPDATE_CHECK_SECONDS,)):
+        now = int(time.time())
+        slot = self.last_daily_slot("updates_check_time")
+        if slot is None:
+            sql, params = "checked < ?", (now - UPDATE_CHECK_SECONDS,)
+        else:
+            # Once after each daily time. A failed check stores a checked time 11 hours back
+            # (see _check_updates), so it is tried again an hour later, whatever the time.
+            sql, params = ("(error = '' AND checked < ?) OR (error != '' AND checked < ?)",
+                           (int(slot.timestamp()), now - UPDATE_CHECK_SECONDS))
+        for row in self.db.all(f"SELECT agent_id FROM hosts WHERE checked IS NULL OR ({sql})",
+                               params):
             self.check_updates(row["agent_id"])
 
     def update_progress(self, agent_id: str) -> int | None:
@@ -4275,7 +4313,7 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             updates=json.loads(row["updates"]) if row else [],
             packages=json.loads(row["packages"]) if row else [],
             check_enabled=monitor.setting("updates_check_enabled"),
-            next_check=(row["checked"] + UPDATE_CHECK_SECONDS) if row and row["checked"] else None)
+            next_check=monitor.next_update_check(row))
 
     def add_history(agent_id: str, filesystems: list[dict]) -> None:
         """The last 30 days of each filesystem: a sparkline of its percentage and its trend."""
@@ -4844,6 +4882,7 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         hours = int(monitor.setting("docker_check_hours"))
         return render_template(
             "docker.html", images=images, counts=counts, hours=hours,
+            check_time=monitor.setting("docker_check_time"), tz_name=str(tz),
             check_hours=IMAGE_CHECK_HOURS, update_text=image_update_text,
             # While a check waits or runs, so its result shows up by itself
             refresh=any(i["checking"] or i["checked"] is None for i in images))
@@ -4982,8 +5021,13 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
         hours = form_int("docker_check_hours", 0, 24)
         if hours not in IMAGE_CHECK_HOURS:
             abort(400, "Choose how often to check from the list.")
+        t = request.form.get("docker_check_time", "").strip()
+        if t and not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", t):
+            abort(400, "The time must look like 04:00, or stay empty")
         db.set_setting("docker_check_hours", hours)
-        flash(f"Docker images are checked {IMAGE_CHECK_HOURS[hours]}.")
+        db.set_setting("docker_check_time", t)
+        flash(f"Docker images are checked {IMAGE_CHECK_HOURS[hours]}"
+              + (f" at {t}." if hours == 24 and t else "."))
         return redirect(url_for("docker_page") + "#docker-settings")
 
     @app.get("/report")
@@ -5040,6 +5084,7 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
             growth_choices=GROWTH_CHOICES, channels=monitor.notifier.channels(),
             weekdays=WEEKDAYS, tz_name=str(tz), rules=monitor.notify_rules(),
             topics=NOTIFY_TOPICS, updates_enabled=monitor.setting("updates_check_enabled"),
+            updates_time=monitor.setting("updates_check_time"),
             api_tokens=db.all("SELECT id, name, created, last_used FROM api_tokens "
                               "ORDER BY name COLLATE NOCASE"))
 
@@ -5077,6 +5122,10 @@ def create_app(cfg: Config | None = None, db: Database | None = None,
 
     @app.post("/settings/updates")
     def settings_updates():
+        t = request.form.get("updates_check_time", "").strip()
+        if t and not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", t):
+            abort(400, "The time must look like 03:00, or stay empty for every 12 hours")
+        db.set_setting("updates_check_time", t)
         db.set_setting("updates_check_enabled", bool(request.form.get("updates_check_enabled")))
         flash("Update check turned on." if request.form.get("updates_check_enabled")
               else "Update check turned off.")

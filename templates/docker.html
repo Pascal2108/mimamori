@@ -8,7 +8,7 @@
   <div class="tile"><div class="label">Watched</div><div class="value">{{ images|length }}</div><div class="sub">image{{ 's' if images|length != 1 }}</div></div>
   <div class="tile"><div class="label">Updates</div><div class="value {{ 'warn' if counts.available else 'ok' }}">{{ counts.available }}</div><div class="sub">{{ 'update by hand, then confirm it here' if counts.available else 'nothing to do' }}</div></div>
   <div class="tile"><div class="label">Errors</div><div class="value {{ 'crit' if counts.error }}">{{ counts.error }}</div><div class="sub">{{ 'registry not reachable or image unknown' if counts.error else 'none' }}</div></div>
-  <div class="tile"><div class="label">Checked</div><div class="value">{{ hours ~ ' h' if hours else 'by hand' }}</div><div class="sub">{{ check_hours[hours] }}</div></div>
+  <div class="tile"><div class="label">Checked</div><div class="value">{{ hours ~ ' h' if hours else 'by hand' }}</div><div class="sub">{{ check_hours[hours] }}{% if hours == 24 and check_time %} at {{ check_time }}{% endif %}</div></div>
 </div>
 
 <div class="panel">
@@ -81,8 +81,11 @@
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <div class="field"><label for="d-hours">Ask the registries</label>
       <select id="d-hours" name="docker_check_hours">{% for h, label in check_hours.items() %}<option value="{{ h }}" {{ 'selected' if h == hours }}>{{ label }}</option>{% endfor %}</select></div>
+    <div class="field"><label for="d-time">Once a day at ({{ tz_name }})</label>
+      <input id="d-time" name="docker_check_time" type="time" value="{{ check_time }}"></div>
     <div class="field"><button class="btn" type="submit">Save</button></div>
   </form>
+  <p class="quiet small">The time counts only with "once a day"; left empty, an image is checked 24 hours after its last check. New images and those you click <b>Check</b> on are checked right away.</p>
   <p class="quiet small">The server asks the registry of each image (Docker Hub, GitHub, Quay, your own registry over HTTPS) which tags exist; for a followed tag such as <span class="mono">latest</span> only which image it points to, which does not count as a pull on Docker Hub. Only public images work: mimamori stores no registry passwords. The agents are not involved. Who gets a notification is set in <a href="{{ url_for('settings') }}#notifications">Settings → Notifications</a> (off by default).</p>
 </div>
 {% endblock %}

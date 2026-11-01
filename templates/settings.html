@@ -168,11 +168,13 @@
 
 <section class="section" id="updates">
   <h2>Updates</h2>
-  <p>Agents whose host mounts its package list (see <span class="mono">volumes</span> in docker-compose.agent.yml) report the installed packages. mimamori checks them twice a day for missing security updates against the <a href="https://osv.dev" rel="noreferrer">OSV vulnerability database</a> (Debian, Ubuntu, Alpine). Drive firmware is compared with a list of known firmware bugs, without any outside connection.</p>
+  <p>Agents whose host mounts its package list (see <span class="mono">volumes</span> in docker-compose.agent.yml) report the installed packages. mimamori checks them twice a day, or daily at a time you choose, for missing security updates against the <a href="https://osv.dev" rel="noreferrer">OSV vulnerability database</a> (Debian, Ubuntu, Alpine). Drive firmware is compared with a list of known firmware bugs, without any outside connection.</p>
   <div class="panel">
     <form method="post" action="{{ url_for('settings_updates') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div class="field"><label class="check"><input type="checkbox" name="updates_check_enabled" value="1" {{ 'checked' if updates_enabled }}> Check host packages for missing security updates</label></div>
+      <div class="field"><label for="ut">Daily at ({{ tz_name }})</label><input id="ut" name="updates_check_time" type="time" value="{{ updates_time }}"></div>
+      <p class="quiet small">Leave the time empty to check every 12 hours. New hosts, changed package lists and "Check updates now" are checked right away either way.</p>
       <p class="quiet small">This sends the names and versions of the installed packages and the system's release (for example Debian:12) to api.osv.dev, run by Google. No host names, addresses or drive data are sent. Off until you turn it on.</p>
       <button class="btn primary" type="submit">Save</button>
     </form>

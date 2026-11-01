@@ -126,7 +126,7 @@ For **Backrest**, add a hook of the type *Healthchecks* to the plan with this UR
 | **Betas included** | `0.3.2` | `0.3.3-beta.1` as well |
 | **This tag** | `latest`, `beta` | the tag pointing to a new image (e.g. a rebuild with security fixes) |
 
-Only tags of the same form count: after `1.27.2-alpine` comes `1.27.3-alpine`. A new version shows up on the overview (and, if you turn it on under **Settings → Notifications**, in your channels). Update the container by hand, e.g. `docker compose pull && docker compose up -d`, then click **Confirm** with the version you now run. The server asks the registries every 12 hours by default, or only when you click **Check**. It never changes anything on your hosts, and the agents are not involved. Only public images work: mimamori stores no registry passwords.
+Only tags of the same form count: after `1.27.2-alpine` comes `1.27.3-alpine`. A new version shows up on the overview (and, if you turn it on under **Settings → Notifications**, in your channels). Update the container by hand, e.g. `docker compose pull && docker compose up -d`, then click **Confirm** with the version you now run. The server asks the registries every 12 hours by default, once a day at a time you choose, or only when you click **Check**. It never changes anything on your hosts, and the agents are not involved. Only public images work: mimamori stores no registry passwords.
 
 ### API and Home Assistant
 
