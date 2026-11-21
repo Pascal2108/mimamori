@@ -1,4 +1,4 @@
-FROM python:3.14-slim
+FROM python:3.15-slim
 
 LABEL org.opencontainers.image.title="mimamori" \
       org.opencontainers.image.description="Self-hosted drive health monitor: the server with the web page, history and alerts. The hosts run the small image mimamori-agent." \

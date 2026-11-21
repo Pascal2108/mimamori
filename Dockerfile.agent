@@ -1,4 +1,4 @@
-FROM python:3.14-alpine
+FROM python:3.15-alpine
 
 LABEL org.opencontainers.image.title="mimamori-agent" \
       org.opencontainers.image.description="Small agent for mimamori: reads the SMART data of a host's drives and reports it to the mimamori server, end-to-end encrypted." \
